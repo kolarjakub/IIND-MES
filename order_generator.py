@@ -43,7 +43,7 @@ def generate_random_company_name(friend_names=None, words=None):
 
     selected_names = random.sample(friend_names, k=random.randint(1, min(2, len(friend_names))))
     selected_word = random.choice(words)
-    suffix = random.choice(["Works", "Factory", "Industries", "Labs", "Dynamics", "Dump", "Brothel", "Empire", "Moms"])
+    suffix = random.choice(["Works", "Factory", "Industries", "Labs", "Dynamics", "Dump", "Brothel", "Empire", "Moms", "Stripclub"])
 
     return f"{'-'.join(selected_names)} {selected_word} {suffix}"
 
@@ -101,7 +101,7 @@ def send_client_order(order, host='localhost', port=6666):
 if __name__ == "__main__":
     for _ in range(5):
         order = generate_random_client_order()
-        print(f"Generated Order: {order}")
+        print(f"{Fore.BLUE}Generated Order: {order}{Style.RESET_ALL}")
         send_client_order(order)
 
 
