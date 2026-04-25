@@ -1,6 +1,7 @@
 import random
 import socket
 import json
+import argparse
 from dataclasses import dataclass
 
 from colorama import init, Fore, Style
@@ -54,6 +55,7 @@ def random_order():
         DDate=random.randint(5, 30),
         Penalty=random.randint(50, 500)
     )
+
 def generate_random_client_order():
     return ClientOrder(
         name=generate_random_company_name(),
@@ -61,6 +63,25 @@ def generate_random_client_order():
         OrderID=random.randint(1, 1000),
         orders=[random_order() for _ in range(random.randint(1, 5))]
     )
+
+def manual_client_order():
+    name = input("Enter company name: ")
+    NIF = int(input("Enter NIF (9 digits): "))
+    OrderID = int(input("Enter OrderID (1-1000): "))
+    orders = []
+
+    while True:
+        type = input(f"Enter order type ({', '.join(VALID_TYPES)}): ")
+        quantity = int(input("Enter quantity: "))
+        DDate = int(input("Enter DDate: "))
+        Penalty = int(input("Enter Penalty: "))
+        orders.append(Order(type, quantity, DDate, Penalty))
+
+        cont = input("Add another order? (y/n): ")
+        if cont.lower() != 'y':
+            break
+
+    return ClientOrder(name, NIF, OrderID, orders)
 
 def validate_client_order(order):
     if not order.name or not isinstance(order.name, str):
@@ -99,9 +120,37 @@ def send_client_order(order, host='localhost', port=6666):
 # Example_
 
 if __name__ == "__main__":
-    for _ in range(5):
+    parser = argparse.ArgumentParser(description="Generate and send client orders")
+    parser.add_argument('-r', '--random', action='store_true', help='Generate a random order')
+    parser.add_argument('-m', '--manual', action='store_true', help='Manually enter an order')
+    parser.add_argument('--host', default='localhost', help='Server host (default: localhost)')
+    parser.add_argument('--port', type=int, default=6666, help='Server port (default: 6666)')
+    
+    args = parser.parse_args()
+    
+    if args.random:
         order = generate_random_client_order()
-        print(f"{Fore.BLUE}Generated Order: {order}{Style.RESET_ALL}")
-        send_client_order(order)
-
+        print(f"{Fore.GREEN}Generated random order:{Style.RESET_ALL} {order}")
+        send_client_order(order, host=args.host, port=args.port)
+    elif args.manual:
+        order = manual_client_order()
+        print(f"{Fore.GREEN}Created manual order:{Style.RESET_ALL} {order}")
+        send_client_order(order, host=args.host, port=args.port)
+    else:
+        while True:
+            choice = input("Generate random order (r) or enter manually (m)? (r/m): ")
+            match choice.lower():
+                case 'r':
+                    order = generate_random_client_order()
+                    print(f"{Fore.GREEN}Generated random order:{Style.RESET_ALL} {order}")
+                    send_client_order(order)
+                case 'm':
+                    order = manual_client_order()
+                    print(f"{Fore.GREEN}Created manual order:{Style.RESET_ALL} {order}")
+                    send_client_order(order)
+                case 'q':
+                    print("Exiting...")
+                    break
+                case _:
+                    print(f"{Fore.RED}Invalid choice, please enter 'r', 'm', or 'q'{Style.RESET_ALL}")    
 
