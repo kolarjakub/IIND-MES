@@ -2,12 +2,12 @@ import random
 import socket
 import json
 import argparse
-from dataclasses import dataclass
+from orders import ClientOrder, Order, VALID_TYPES
 
 from colorama import init, Fore, Style
 init(autoreset=True)
 
-VALID_TYPES = ["RWW", "SWW", "RWM", "SWM", "RMM", "SMM"]
+
 
 DEFAULT_FRIEND_NAMES = ["Mike", "Jakub", "Joao", "Tiago"]
 DEFAULT_WORDS = [
@@ -22,20 +22,11 @@ DEFAULT_WORDS = [
     "Giggle",
     "Meme"
 ]
+# So Professor showed that the orders come to MES through a socket connection,
+# so we will create a simple order generator that can send orders to the MES system.
+# The orders will be in JSON format and will contain information about the client, the order ID, and the list of items in the order.
 
-@dataclass
-class Order:
-    type: str
-    quantity: int
-    DDate: int
-    Penalty: int
 
-@dataclass
-class ClientOrder:
-    name: str
-    NIF: int
-    OrderID: int
-    orders: list[Order]
 
 
 def generate_random_company_name(friend_names=None, words=None):

@@ -1,9 +1,11 @@
 import socket
 import time
 import argparse
+import json
 from colorama import init, Fore, Style
-init(autoreset=True)
+from orders import ClientOrder, Order, VALID_TYPES
 
+init(autoreset=True)
 # If the order comes through socket connection, we need to create a simple server that listens
 # for incoming connections and prints the received orders.
 # We will use the socket library for this purpose. The server will run indefinitely until it is manually stopped.
@@ -15,6 +17,9 @@ class OrderReceiver:
         self.accept_timeout = accept_timeout
         self.client_timeout = client_timeout
         self.sock = None
+
+        self.orders_received = 0
+        self.on_order_received = None  # Optional callback for when an order is received
 
     def start_server(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -42,7 +47,15 @@ class OrderReceiver:
                 data = client_sock.recv(1024).decode('utf-8')
                 if data:
                     print(Fore.YELLOW + f"Received order: {data}")
-                    # Here you can add code to process the order
+                    try:
+                        order = json.loads(data)
+                        order = ClientOrder.from_dict(json.loads(data))
+                        print(Fore.GREEN + f"Processed order: {order}")
+                        self.orders_received += 1
+                        if self.on_order_received:
+                            self.on_order_received(order)
+                    except json.JSONDecodeError:
+                        print(Fore.RED + "Failed to decode order JSON")
                     idle_started = time.time()
             except socket.timeout:
                 print(Fore.RED + f"Connection {addr} timed out while receiving data")
@@ -53,6 +66,9 @@ class OrderReceiver:
         if self.sock:
             self.sock.close()
             print(Fore.RED + "Order Receiver stopped.")
+    
+    def get_orders_received(self):
+        return self.orders_received
 
 
 def main():
