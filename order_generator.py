@@ -22,9 +22,11 @@ DEFAULT_WORDS = [
     "Giggle",
     "Meme"
 ]
-# So Professor showed that the orders come to MES through a socket connection,
-# so we will create a simple order generator that can send orders to the MES system.
-# The orders will be in JSON format and will contain information about the client, the order ID, and the list of items in the order.
+# order_generator.py builds and sends JSON-encoded ClientOrder objects to the MES receiver over a TCP socket on port 6666.
+# Orders can be generated randomly (random company name, valid product type, quantity, delivery date, penalty) or entered manually via CLI prompts.
+# Each order is validated before sending — checking NIF format, valid product types, positive quantities, and non-negative penalties.
+# Run with -r for a single random order, -m for manual input, or with no flags for an interactive loop (r/m/q to quit).
+# Import generate_random_client_order() and send_client_order() directly into other modules to programmatically fire orders without the CLI.
 
 
 
