@@ -4,6 +4,10 @@ import argparse
 from colorama import init, Fore, Style
 init(autoreset=True)
 
+# If the order comes through socket connection, we need to create a simple server that listens
+# for incoming connections and prints the received orders.
+# We will use the socket library for this purpose. The server will run indefinitely until it is manually stopped.
+
 class OrderReceiver:
     def __init__(self, host='localhost', port=6666, accept_timeout=10, client_timeout=5):
         self.host = host
