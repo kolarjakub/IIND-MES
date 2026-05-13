@@ -2,7 +2,6 @@ colorama==0.4.6
 lxml==6.1.0
 opcua==0.98.13
 packaging==26.0
-psycopg2 @ file:///Users/ec2-user/croot/psycopg2_1766163908050/work
 psycopg2-binary==2.9.12
 python-dateutil==2.9.0.post0
 pytz==2026.2
