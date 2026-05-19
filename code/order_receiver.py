@@ -24,6 +24,15 @@ class OrderReceiver:
         self.on_order_received = on_order_received  # Optional callback for when an order is received
         self.idle_started = time.time()
 
+        if on_order_received is None:
+            print(Fore.YELLOW + "No order received callback provided. Orders will be counted but not processed.")
+            self.on_order_received = []
+        elif callable(on_order_received):
+            self.on_order_received = [on_order_received]
+        else:
+            self.on_order_received = list(on_order_received)  # Assume it's an iterable of callables
+            
+
     def start_server(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -66,7 +75,8 @@ class OrderReceiver:
                         self.orders_received += 1
                         self.idle_started = time.time()
                         if self.on_order_received:
-                            self.on_order_received(order)
+                            for callback in self.on_order_received:
+                                callback(order)
                     except json.JSONDecodeError:
                         print(Fore.RED + f"Failed to decode JSON from {addr}")
                     except (KeyError, TypeError) as e:
