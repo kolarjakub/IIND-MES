@@ -21,7 +21,7 @@ RAW_MATERIALS = {
     "SMM": {"Wood": 0, "Metal": 3}
 }
 
-IN_PROGRESS_BOOST = 2.0
+
 
 @dataclass
 class Order:
@@ -74,11 +74,20 @@ class ActiveOrder:
     def estimated_time_remaining(self):
         return self.remaining_quantity * ESTIMATED_TIME.get(self.piece_type, 0)
     
-    def calculate_priority(self) -> float:
+    def calculate_priority(self, in_progress_boost: float) -> float:
         t = self.estimated_time_remaining 
         if t == 0:
             return 0.0
         base = self.penalty / t
-        boost = IN_PROGRESS_BOOST if self.status == "IN_PROGRESS" else 1.0
+        boost = in_progress_boost if self.status == "IN_PROGRESS" else 1.0
         self.priority = base * boost
         return self.priority
+    
+@dataclass
+class WarehouseState:
+    wood: int
+    metal: int
+
+    @property
+    def total(self):
+        return self.wood + self.metal

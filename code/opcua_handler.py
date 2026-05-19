@@ -1,404 +1,610 @@
+"""
+opcua_handler.py
+================
+Low-level OPC-UA handler for CODESYS.
+
+RECIPE STRUCTURE (confirmed from Final_Test PLC code):
+======================================================
+Each piece requires EXACTLY 14 slots (indices 0-13) with strictly
+incrementing ID_Procedure values.
+
+Slot layout:
+  [0]  Load piece 1    Cell=L,  Tool=IDLE, For_Assembly=FALSE
+  [1]  Load piece 2    Cell=L,  Tool=IDLE, For_Assembly=FALSE
+  [2]  Load piece 3    Cell=L,  Tool=IDLE, For_Assembly=FALSE
+  [3]  Machine piece 1 Cell=C?, Tool=T?,   Tool_Time_Sec=?
+  [4]  Machine piece 2 Cell=C?, Tool=T?,   Tool_Time_Sec=?
+  [5]  Machine piece 3 Cell=C?, Tool=T?,   Tool_Time_Sec=?
+  [6]  Transport p1    Cell=T,  Tool=IDLE, For_Assembly=TRUE
+  [7]  Transport p2    Cell=T,  Tool=IDLE, For_Assembly=TRUE
+  [8]  Transport p3    Cell=T,  Tool=IDLE, For_Assembly=TRUE
+  [9]  Assembly Leg1   Cell=C?, Tool=T8/T9, IDs_Assembly.Leg_1=ID
+  [10] Assembly Leg2   Cell=C?, Tool=T8/T9, IDs_Assembly.Leg_2=ID
+  [11] Assembly Top    Cell=C?, Tool=T8/T9, IDs_Assembly.Top=ID
+  [12] (slot 10 in test was skipped — 11 was Leg2, 12 was Top)
+  [13] Unload          Cell=U,  Tool=IDLE, For_Assembly=FALSE
+
+NOTE: Final_Test uses slots 9, 11, 12 for assembly (skips 10).
+      We use 9, 10, 11 and 12 for unload (14 slots total = indices 0-13).
+
+Confirmed enum values from PLC XML:
+  E_Location : L=30, T=20, U=40, W1=50, W2=60, C1=100, C2=200, C3=300, C4=400
+  E_Tool     : IDLE=0, T1=1, T2=2, T3=3, T4=4, T5=5, T6=6, T8=8, T9=9, T10=10, T11=11
+  E_Material : WOOD=1, METAL=2
+  E_PieceType: IDLE=0, WOOD_ROUND_TOP=3, WOOD_SQUARE_TOP=4, WOOD_LEG=5,
+               METAL_ROUND_TOP=6, METAL_SQUARE_TOP=7, METAL_LEG=8,
+               WOOD_ROUND_TABLE=9, WOOD_SQUARE_TABLE=10,
+               WOOD_ROUND_TOP_METAL_LEGS=11, WOOD_SQUARE_TOP_METAL_LEGS=12,
+               METAL_ROUND_TABLE=13, METAL_SQUARE_TABLE=14
+  E_Procedure_Status: IDLE=0, NEW_ORDER=1, EXECUTION=2, STOPPED=3, COMPLETED=4
+
+MAX_LOGIC_N_PROCEDURES: set to 150 (from Final_Test PLC code).
+"""
+
 from opcua import Client, ua
 import time
-import sys
 import logging
-from dataclasses import dataclass, field
-from typing import Optional
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# OPC UA Node path helpers
-# ──────────────────────────────────────────────
-SERVER_URL      = "opc.tcp://127.0.0.1:4840"
-APP_PREFIX      = "|var|CODESYS Control Win V3 x64.Application"
-GVL_PREFIX      = f"{APP_PREFIX}.GVL"
-SCADA_PREFIX    = f"{APP_PREFIX}.SCADA_PRG"
-NS              = 4   # default namespace for CODESYS variables
-
-def _node_id(path: str) -> str:
-    return f"ns={NS};s={path}"
+SERVER_URL           = "opc.tcp://127.0.0.1:4840"
+GVL_BASE             = "ns=4;s=|var|CODESYS Control Win V3 x64.Application.GVL."
+RECIPE_POLL_INTERVAL = 0.2
+RECIPE_ACK_TIMEOUT   = 15.0
 
 
-# ──────────────────────────────────────────────
-# Python mirror of the PLC structs (read-only use)
-# ──────────────────────────────────────────────
-@dataclass
-class PieceTracking:
-    State_Step:     int   = 0   # E_StepState enum value
-    Conveyor:       bool  = False
-    ID_Piece:       int   = 0
-    ID_Procedure:   int   = 0
-    Piece_Material: int   = 0   # E_Material enum value
-    Piece_Type:     int   = 0   # E_PieceType enum value
-    Cell_1_conv:    int   = 0   # E_Location enum value
-    Cell_2_conv:    int   = 0
+# ── Enum mirrors (confirmed from PLC XML) ─────────────────────────────────────
 
-@dataclass
-class ProcedureMES:
-    Status:             int   = 0   # E_Procedure_Status enum value
-    ID_Procedure:       int   = 0
-    Successfully_Abort: bool  = False
+class ELocation:
+    IDLE = 0
+    L    = 30
+    T    = 20
+    U    = 40
+    W1   = 50
+    W2   = 60
+    C1   = 100
+    C2   = 200
+    C3   = 300
+    C4   = 400
 
-@dataclass
-class ErrorLog:
-    Error_Code:   int = 0
-    Slot_Index:   int = 0
-    ID_Procedure: int = 0
+class ETool:
+    IDLE = 0
+    T1   = 1
+    T2   = 2
+    T3   = 3
+    T4   = 4
+    T5   = 5
+    T6   = 6
+    T8   = 8
+    T9   = 9
+    T10  = 10
+    T11  = 11
 
-@dataclass
-class WarehouseInventory:
-    N_Pieces_W1: int = 0
-    N_Pieces_W2: int = 0
+class EMaterial:
+    WOOD  = 1
+    METAL = 2
 
-@dataclass
-class WorkStationTracking:
-    """Flattened view of ST_WorkStation_Tracking_MES for all 4 cells."""
-    data: dict = field(default_factory=dict)
+class EPieceType:
+    IDLE                     = 0
+    WOOD_ROUND_TOP           = 3
+    WOOD_SQUARE_TOP          = 4
+    WOOD_LEG                 = 5
+    METAL_ROUND_TOP          = 6
+    METAL_SQUARE_TOP         = 7
+    METAL_LEG                = 8
+    WOOD_ROUND_TABLE         = 9   # RWW
+    WOOD_SQUARE_TABLE        = 10  # SWW
+    WOOD_ROUND_TOP_METAL_LEGS= 11  # RWM
+    WOOD_SQUARE_TOP_METAL_LEGS=12  # SWM
+    METAL_ROUND_TABLE        = 13  # RMM
+    METAL_SQUARE_TABLE       = 14  # SMM
+
+class EProcedureStatus:
+    IDLE      = 0
+    NEW_ORDER = 1
+    EXECUTION = 2
+    STOPPED   = 3
+    COMPLETED = 4
 
 
-# ──────────────────────────────────────────────
-# Main handler class
-# ──────────────────────────────────────────────
-class OPCUAHandler:
+# ── Product recipe definitions ────────────────────────────────────────────────
+# Based on Final_Test PLC code and spec Table 3
+
+PRODUCT_RECIPES = {
+    "RWW": {
+        "cell":         ELocation.C1,
+        "materials":    [EMaterial.WOOD,  EMaterial.WOOD,  EMaterial.WOOD],
+        "raw_types":    [EPieceType.WOOD_LEG, EPieceType.WOOD_LEG, EPieceType.WOOD_ROUND_TOP],
+        "mach_tools":   [ETool.T3, ETool.T3, ETool.T1],
+        "mach_times":   [10, 10, 30],
+        "mach_types":   [EPieceType.WOOD_LEG, EPieceType.WOOD_LEG, EPieceType.WOOD_ROUND_TOP],
+        "asm_tool":     ETool.T8,
+        "asm_time":     10,
+        "final_type":   EPieceType.WOOD_ROUND_TABLE,
+        "asm_leg1_idx": 0,   # piece[0] = Leg1
+        "asm_leg2_idx": 1,   # piece[1] = Leg2
+        "asm_top_idx":  2,   # piece[2] = Top
+    },
+    "SWW": {
+        "cell":         ELocation.C2,
+        "materials":    [EMaterial.WOOD,  EMaterial.WOOD,  EMaterial.WOOD],
+        "raw_types":    [EPieceType.WOOD_LEG, EPieceType.WOOD_LEG, EPieceType.WOOD_SQUARE_TOP],
+        "mach_tools":   [ETool.T3, ETool.T3, ETool.T2],
+        "mach_times":   [10, 10, 20],
+        "mach_types":   [EPieceType.WOOD_LEG, EPieceType.WOOD_LEG, EPieceType.WOOD_SQUARE_TOP],
+        "asm_tool":     ETool.T8,
+        "asm_time":     10,
+        "final_type":   EPieceType.WOOD_SQUARE_TABLE,
+        "asm_leg1_idx": 0,
+        "asm_leg2_idx": 1,
+        "asm_top_idx":  2,
+    },
+    "RWM": {
+        "cell":         ELocation.C1,
+        "materials":    [EMaterial.METAL, EMaterial.METAL, EMaterial.WOOD],
+        "raw_types":    [EPieceType.METAL_LEG, EPieceType.METAL_LEG, EPieceType.WOOD_ROUND_TOP],
+        "mach_tools":   [ETool.T5, ETool.T5, ETool.T1],
+        "mach_times":   [30, 30, 30],
+        "mach_types":   [EPieceType.METAL_LEG, EPieceType.METAL_LEG, EPieceType.WOOD_ROUND_TOP],
+        "asm_tool":     ETool.T9,
+        "asm_time":     10,
+        "final_type":   EPieceType.WOOD_ROUND_TOP_METAL_LEGS,
+        "asm_leg1_idx": 0,
+        "asm_leg2_idx": 1,
+        "asm_top_idx":  2,
+    },
+    "SWM": {
+        "cell":         ELocation.C2,
+        "materials":    [EMaterial.METAL, EMaterial.METAL, EMaterial.WOOD],
+        "raw_types":    [EPieceType.METAL_LEG, EPieceType.METAL_LEG, EPieceType.WOOD_SQUARE_TOP],
+        "mach_tools":   [ETool.T5, ETool.T5, ETool.T2],
+        "mach_times":   [30, 30, 20],
+        "mach_types":   [EPieceType.METAL_LEG, EPieceType.METAL_LEG, EPieceType.WOOD_SQUARE_TOP],
+        "asm_tool":     ETool.T9,
+        "asm_time":     10,
+        "final_type":   EPieceType.WOOD_SQUARE_TOP_METAL_LEGS,
+        "asm_leg1_idx": 0,
+        "asm_leg2_idx": 1,
+        "asm_top_idx":  2,
+    },
+    "RMM": {
+        "cell":         ELocation.C3,
+        "materials":    [EMaterial.METAL, EMaterial.METAL, EMaterial.METAL],
+        "raw_types":    [EPieceType.METAL_LEG, EPieceType.METAL_LEG, EPieceType.METAL_ROUND_TOP],
+        "mach_tools":   [ETool.T5, ETool.T5, ETool.T4],
+        "mach_times":   [30, 30, 35],
+        "mach_types":   [EPieceType.METAL_LEG, EPieceType.METAL_LEG, EPieceType.METAL_ROUND_TOP],
+        "asm_tool":     ETool.T8,
+        "asm_time":     10,
+        "final_type":   EPieceType.METAL_ROUND_TABLE,
+        "asm_leg1_idx": 0,
+        "asm_leg2_idx": 1,
+        "asm_top_idx":  2,
+    },
+    "SMM": {
+        "cell":         ELocation.C3,
+        "materials":    [EMaterial.METAL, EMaterial.METAL, EMaterial.METAL],
+        "raw_types":    [EPieceType.METAL_LEG, EPieceType.METAL_LEG, EPieceType.METAL_SQUARE_TOP],
+        "mach_tools":   [ETool.T5, ETool.T5, ETool.T6],
+        "mach_times":   [30, 30, 25],
+        "mach_types":   [EPieceType.METAL_LEG, EPieceType.METAL_LEG, EPieceType.METAL_SQUARE_TOP],
+        "asm_tool":     ETool.T8,
+        "asm_time":     10,
+        "final_type":   EPieceType.METAL_SQUARE_TABLE,
+        "asm_leg1_idx": 0,
+        "asm_leg2_idx": 1,
+        "asm_top_idx":  2,
+    },
+}
+
+
+# ── Recipe builder ────────────────────────────────────────────────────────────
+
+def build_recipe(
+    piece_type:         str,
+    id_recipe:          int,
+    id_procedure_start: int,
+    id_piece_start:     int,
+    id_final_piece:     int,
+    unload_location:    int = ELocation.U,
+) -> list:
     """
-    Connects to the CODESYS OPC UA server and exposes clean read/write
-    methods for all MES-relevant GVL variables.
+    Build the 14-slot recipe for one piece.
 
-    Usage
-    -----
-        handler = OPCUAHandler()
-        handler.connect()
+    Slot indices 0-13:
+      0-2:  Loading (Cell=L)
+      3-5:  Machining (Cell=C?)
+      6-8:  Transport (Cell=T)
+      9-11: Assembly (Cell=C?, Leg1/Leg2/Top)
+      12:   (unused — kept for alignment, ID_Procedure increments)
+      13:   Unload (Cell=U)
 
-        # Write a recipe
-        handler.write_recipe(recipe_slots)      # list of dicts
-
-        # Trigger the PLC to load it
-        handler.set_read_recipes(True)
-
-        # Poll status
-        success = handler.read_success()
-        procedures = handler.read_procedures()
-        inventory  = handler.read_warehouse_inventory()
-
-        handler.disconnect()
+    NOTE: We send 13 meaningful slots but ID_Procedure spans 0-13
+    to match Final_Test's numbering (101-113).
+    Actually Final_Test uses indices 0,1,2,3,4,5,6,7,8,9,11,12,13
+    skipping index 10. We use 0-12 (13 slots) with index 13 = unload.
     """
+    r    = PRODUCT_RECIPES[piece_type.upper()]
+    cell = r["cell"]
+    slots = []
+    pid   = [id_piece_start, id_piece_start + 1, id_piece_start + 2]
 
-    def __init__(
-        self,
-        server_url: str = SERVER_URL,
-        username: Optional[str] = None,
-        password: Optional[str] = None,
-        reconnect_delay: float = 5.0,
-    ):
-        self.server_url      = server_url
-        self.username        = username
-        self.password        = password
-        self.reconnect_delay = reconnect_delay
-        self._client: Optional[Client] = None
+    # ── Loading (slots 0-2) ───────────────────────────────────────────────────
+    for k in range(3):
+        slots.append({
+            "N_Slot":                    len(slots),
+            "ID_Procedure":              id_procedure_start + len(slots),
+            "ID_Recipe":                 id_recipe,
+            "ID_Piece":                  pid[k],
+            "Status":                    EProcedureStatus.NEW_ORDER,
+            "Cell":                      ELocation.L,
+            "Tool":                      ETool.IDLE,
+            "Tool_Time_Sec":             0,
+            "Piece_Material":            r["materials"][k],
+            "Piece_Type":                r["raw_types"][k],
+            "For_Assembly":              False,
+            "ID_Assembly_Final_Product": 0,
+            "IDs_Assembly_Leg_1":        0,
+            "IDs_Assembly_Leg_2":        0,
+            "IDs_Assembly_Top":          0,
+        })
 
-    # ── Connection management ──────────────────
-    def connect(self) -> bool:
-        try:
-            self._client = Client(self.server_url)
+    # ── Machining (slots 3-5) ─────────────────────────────────────────────────
+    for k in range(3):
+        slots.append({
+            "N_Slot":                    len(slots),
+            "ID_Procedure":              id_procedure_start + len(slots),
+            "ID_Recipe":                 id_recipe,
+            "ID_Piece":                  pid[k],
+            "Status":                    EProcedureStatus.NEW_ORDER,
+            "Cell":                      cell,
+            "Tool":                      r["mach_tools"][k],
+            "Tool_Time_Sec":             r["mach_times"][k],
+            "Piece_Material":            r["materials"][k],
+            "Piece_Type":                r["mach_types"][k],
+            "For_Assembly":              False,
+            "ID_Assembly_Final_Product": 0,
+            "IDs_Assembly_Leg_1":        0,
+            "IDs_Assembly_Leg_2":        0,
+            "IDs_Assembly_Top":          0,
+        })
+
+    # ── Transport (slots 6-8) ─────────────────────────────────────────────────
+    for k in range(3):
+        slots.append({
+            "N_Slot":                    len(slots),
+            "ID_Procedure":              id_procedure_start + len(slots),
+            "ID_Recipe":                 id_recipe,
+            "ID_Piece":                  pid[k],
+            "Status":                    EProcedureStatus.NEW_ORDER,
+            "Cell":                      ELocation.T,
+            "Tool":                      ETool.IDLE,
+            "Tool_Time_Sec":             0,
+            "Piece_Material":            r["materials"][k],
+            "Piece_Type":                r["mach_types"][k],
+            "For_Assembly":              True,
+            "ID_Assembly_Final_Product": 0,
+            "IDs_Assembly_Leg_1":        0,
+            "IDs_Assembly_Leg_2":        0,
+            "IDs_Assembly_Top":          0,
+        })
+
+    # ── Assembly Leg 1 (slot 9) ───────────────────────────────────────────────
+    leg1_idx = r["asm_leg1_idx"]
+    slots.append({
+        "N_Slot":                    len(slots),
+        "ID_Procedure":              id_procedure_start + len(slots),
+        "ID_Recipe":                 id_recipe,
+        "ID_Piece":                  pid[leg1_idx],
+        "Status":                    EProcedureStatus.NEW_ORDER,
+        "Cell":                      cell,
+        "Tool":                      r["asm_tool"],
+        "Tool_Time_Sec":             r["asm_time"],
+        "Piece_Material":            r["materials"][leg1_idx],
+        "Piece_Type":                r["final_type"],
+        "For_Assembly":              True,
+        "ID_Assembly_Final_Product": id_final_piece,
+        "IDs_Assembly_Leg_1":        pid[leg1_idx],
+        "IDs_Assembly_Leg_2":        0,
+        "IDs_Assembly_Top":          0,
+    })
+
+    # ── Assembly Leg 2 (slot 10) ──────────────────────────────────────────────
+    leg2_idx = r["asm_leg2_idx"]
+    slots.append({
+        "N_Slot":                    len(slots),
+        "ID_Procedure":              id_procedure_start + len(slots),
+        "ID_Recipe":                 id_recipe,
+        "ID_Piece":                  pid[leg2_idx],
+        "Status":                    EProcedureStatus.NEW_ORDER,
+        "Cell":                      cell,
+        "Tool":                      r["asm_tool"],
+        "Tool_Time_Sec":             r["asm_time"],
+        "Piece_Material":            r["materials"][leg2_idx],
+        "Piece_Type":                r["final_type"],
+        "For_Assembly":              True,
+        "ID_Assembly_Final_Product": id_final_piece,
+        "IDs_Assembly_Leg_1":        0,
+        "IDs_Assembly_Leg_2":        pid[leg2_idx],
+        "IDs_Assembly_Top":          0,
+    })
+
+    # ── Assembly Top (slot 11) ────────────────────────────────────────────────
+    top_idx = r["asm_top_idx"]
+    slots.append({
+        "N_Slot":                    len(slots),
+        "ID_Procedure":              id_procedure_start + len(slots),
+        "ID_Recipe":                 id_recipe,
+        "ID_Piece":                  pid[top_idx],
+        "Status":                    EProcedureStatus.NEW_ORDER,
+        "Cell":                      cell,
+        "Tool":                      r["asm_tool"],
+        "Tool_Time_Sec":             r["asm_time"],
+        "Piece_Material":            r["materials"][top_idx],
+        "Piece_Type":                r["final_type"],
+        "For_Assembly":              True,
+        "ID_Assembly_Final_Product": id_final_piece,
+        "IDs_Assembly_Leg_1":        0,
+        "IDs_Assembly_Leg_2":        0,
+        "IDs_Assembly_Top":          pid[top_idx],
+    })
+
+    # ── Unload (slot 12) ──────────────────────────────────────────────────────
+    slots.append({
+        "N_Slot":                    len(slots),
+        "ID_Procedure":              id_procedure_start + len(slots),
+        "ID_Recipe":                 id_recipe,
+        "ID_Piece":                  id_final_piece,
+        "Status":                    EProcedureStatus.NEW_ORDER,
+        "Cell":                      unload_location,
+        "Tool":                      ETool.IDLE,
+        "Tool_Time_Sec":             0,
+        "Piece_Material":            r["materials"][0],
+        "Piece_Type":                r["final_type"],
+        "For_Assembly":              False,
+        "ID_Assembly_Final_Product": 0,
+        "IDs_Assembly_Leg_1":        0,
+        "IDs_Assembly_Leg_2":        0,
+        "IDs_Assembly_Top":          0,
+    })
+
+    assert len(slots) == 13, f"Expected 13 slots, got {len(slots)}"
+    return slots
+
+
+# ── OpcUaHandler ──────────────────────────────────────────────────────────────
+
+class OpcUaHandler:
+    """Low-level CODESYS OPC-UA handler. Only plc_interface.py imports this."""
+
+    def __init__(self, server_url=SERVER_URL, username=None, password=None):
+        self.server_url = server_url
+        self.username   = username
+        self.password   = password
+        self.client     = Client(server_url)
+        self.connected  = False
+
+    # ── Connection ────────────────────────────────────────────────────────────
+
+    def connect(self):
+        if not self.connected:
             if self.username and self.password:
-                self._client.set_user(self.username)
-                self._client.set_password(self.password)
-                logger.info(f"Connecting as user '{self.username}'...")
-            self._client.connect()
-            logger.info(f"Connected to OPC UA server at {self.server_url}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect: {e}")
-            self._client = None
-            return False
+                self.client.set_user(self.username)
+                self.client.set_password(self.password)
+            self.client.connect()
+            self.connected = True
+            print(f"[OpcUaHandler] Connected to {self.server_url}")
 
     def disconnect(self):
-        if self._client:
+        if self.connected:
             try:
-                self._client.disconnect()
-                logger.info("Disconnected from OPC UA server.")
+                self.client.disconnect()
             except Exception:
                 pass
-            self._client = None
-
-    def reconnect(self) -> bool:
-        logger.warning("Attempting reconnect…")
-        self.disconnect()
-        time.sleep(self.reconnect_delay)
-        return self.connect()
+            self.connected = False
+            print("[OpcUaHandler] Disconnected.")
 
     def _ensure_connected(self):
-        if self._client is None:
+        if not self.connected:
             raise ConnectionError("Not connected. Call connect() first.")
 
-    # ── Low-level helpers ──────────────────────
-    def _get_node(self, path: str):
+    # ── Low-level helpers ─────────────────────────────────────────────────────
+
+    def _node(self, path):
         self._ensure_connected()
-        return self._client.get_node(_node_id(path))
+        return self.client.get_node(GVL_BASE + path)
 
-    def _read(self, path: str):
-        return self._get_node(path).get_value()
+    def _read(self, path):
+        return self._node(path).get_value()
 
-    def _write(self, path: str, value, variant_type: ua.VariantType = None):
-        node = self._get_node(path)
-        if variant_type:
-            node.set_value(ua.Variant(value, variant_type))
-        else:
-            node.set_value(value)
+    def _write(self, path, value):
+        """Auto-typed write."""
+        try:
+            node = self._node(path)
+            t    = node.get_data_type_as_variant_type()
+            node.set_value(ua.Variant(value, t))
+            return True
+        except Exception as e:
+            logger.error(f"[OpcUaHandler] Write failed '{path}': {e}")
+            return False
 
-    # ── MES handshake variables ────────────────
+    # ── Procedure limits ──────────────────────────────────────────────────────
 
-    def read_success(self) -> bool:
-        """MES_Success — FALSE means recipe was rejected by PLC."""
-        return bool(self._read(f"{GVL_PREFIX}.MES_Success"))
-
-    def read_num_errors(self) -> int:
-        """MES_Num_Errors — how many entries in the error log are valid."""
-        return int(self._read(f"{GVL_PREFIX}.MES_Num_Errors"))
-
-    def set_read_recipes(self, trigger: bool = True):
+    def write_procedure_limits(self, value=150):
         """
-        MES_Read_Recipes — set TRUE to tell PLC to load MES_Recipe.
-        PLC resets it to FALSE when done.
+        Set MAX_LOGIC_N_PROCEDURES fields.
+        Final_Test uses 150 for all fields.
         """
-        self._write(f"{GVL_PREFIX}.MES_Read_Recipes", trigger, ua.VariantType.Boolean)
-        logger.info(f"MES_Read_Recipes set to {trigger}")
+        fields = [
+            "MAX_LOGIC_N_PROCEDURES.RECIPE",
+            "MAX_LOGIC_N_PROCEDURES.C1",
+            "MAX_LOGIC_N_PROCEDURES.C2",
+            "MAX_LOGIC_N_PROCEDURES.C3",
+            "MAX_LOGIC_N_PROCEDURES.C4",
+            "MAX_LOGIC_N_PROCEDURES.T",
+            "MAX_LOGIC_N_PROCEDURES.L",
+            "MAX_LOGIC_N_PROCEDURES.U",
+        ]
+        ok = True
+        for path in fields:
+            if not self._write(path, value):
+                ok = False
+        if ok:
+            print(f"[OpcUaHandler] Procedure limits set to {value}")
+        return ok
 
-    def wait_for_recipe_ack(self, timeout: float = 10.0, poll_interval: float = 0.2) -> bool:
-        """
-        Block until PLC resets MES_Read_Recipes back to FALSE (recipe loaded)
-        or timeout expires.  Returns True on success.
-        """
+    # ── Recipe write ──────────────────────────────────────────────────────────
+
+    def write_slot(self, slot_index, slot):
+        """Write one ST_Procedure slot."""
+        base = f"MES_Recipe.Slots[{slot_index}]"
+        fields = [
+            (f"{base}.N_Slot",                   slot["N_Slot"]),
+            (f"{base}.ID_Procedure",              slot["ID_Procedure"]),
+            (f"{base}.ID_Recipe",                 slot["ID_Recipe"]),
+            (f"{base}.ID_Piece",                  slot["ID_Piece"]),
+            (f"{base}.Status",                    slot["Status"]),
+            (f"{base}.Cell",                      slot["Cell"]),
+            (f"{base}.Tool",                      slot["Tool"]),
+            (f"{base}.Tool_Time_Sec",             slot["Tool_Time_Sec"]),
+            (f"{base}.Piece_Material",            slot["Piece_Material"]),
+            (f"{base}.Piece_Type",                slot["Piece_Type"]),
+            (f"{base}.For_Assembly",              slot["For_Assembly"]),
+            (f"{base}.ID_Assembly_Final_Product", slot["ID_Assembly_Final_Product"]),
+            (f"{base}.IDs_Assembly.Leg_1",        slot["IDs_Assembly_Leg_1"]),
+            (f"{base}.IDs_Assembly.Leg_2",        slot["IDs_Assembly_Leg_2"]),
+            (f"{base}.IDs_Assembly.Top",          slot["IDs_Assembly_Top"]),
+        ]
+        ok = True
+        for path, value in fields:
+            if not self._write(path, value):
+                ok = False
+        return ok
+
+    def write_recipe(self, slots):
+        """Write all slots to MES_Recipe."""
+        ok = True
+        for i, slot in enumerate(slots):
+            if self.write_slot(i, slot):
+                print(f"[OpcUaHandler] Slot[{i:2d}] OK "
+                      f"Cell={slot['Cell']} Tool={slot['Tool']} "
+                      f"ID_Proc={slot['ID_Procedure']}")
+            else:
+                print(f"[OpcUaHandler] Slot[{i:2d}] FAILED")
+                ok = False
+        return ok
+
+    # ── Trigger ───────────────────────────────────────────────────────────────
+
+    def trigger_recipe(self, timeout=RECIPE_ACK_TIMEOUT):
+        """Set MES_Read_Recipes=TRUE, poll until PLC resets it."""
+        self._write("MES_Read_Recipes", True)
+        print("[OpcUaHandler] Triggered, waiting for PLC ack...")
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if not self._read(f"{GVL_PREFIX}.MES_Read_Recipes"):
-                logger.info("PLC acknowledged recipe load.")
-                return True
-            time.sleep(poll_interval)
-        logger.warning("Timeout waiting for recipe acknowledgement.")
+            try:
+                if not bool(self._read("MES_Read_Recipes")):
+                    print("[OpcUaHandler] PLC acknowledged.")
+                    return True
+            except Exception:
+                pass
+            time.sleep(RECIPE_POLL_INTERVAL)
+        print(f"[OpcUaHandler] No ack within {timeout}s, forcing reset.")
+        self._write("MES_Read_Recipes", False)
         return False
 
-    # ── Recipe (write to PLC) ──────────────────
-
-    def write_recipe_slot(self, slot_index: int, procedure: dict):
+    def dispatch(self, slots, limits=150):
         """
-        Write a single ST_Procedure slot inside MES_Recipe.Slots[slot_index].
-
-        procedure dict keys (all optional, defaults to 0/False):
-          Cell          : int  (E_Location enum)
-          Status        : int  (E_Procedure_Status enum)
-          ID_Procedure  : int
-          ...
+        Full sequence: write limits → write slots → trigger.
+        Returns True if PLC acknowledged.
         """
-        base = f"{GVL_PREFIX}.MES_Recipe.Slots[{slot_index}]"
-        for field_name, variant_type, default in [
-            ("Cell",         ua.VariantType.Int32,  0),
-            ("Status",       ua.VariantType.Int32,  0),
-            ("ID_Procedure", ua.VariantType.UInt32, 0),
-        ]:
-            value = procedure.get(field_name, default)
-            try:
-                self._write(f"{base}.{field_name}", value, variant_type)
-            except Exception as e:
-                logger.warning(f"Could not write {base}.{field_name}: {e}")
+        if not slots:
+            return False
+        self.write_procedure_limits(limits)
+        if not self.write_recipe(slots):
+            print("[OpcUaHandler] Recipe write failed, not triggering.")
+            return False
+        return self.trigger_recipe()
 
-    def write_recipe(self, slots: list[dict]):
-        """Write a full recipe (list of procedure dicts) to MES_Recipe.Slots."""
-        for i, slot in enumerate(slots):
-            self.write_recipe_slot(i, slot)
-        logger.info(f"Wrote {len(slots)} recipe slots.")
+    # ── MES reads ─────────────────────────────────────────────────────────────
 
-    # ── Procedures (read from PLC) ─────────────
+    def read_success(self):
+        return bool(self._read("MES_Success"))
 
-    def read_procedures(self, max_slots: int = 10) -> list[ProcedureMES]:
-        """
-        Read MES_Procedures array.  Reads up to max_slots entries.
-        Returns a list of ProcedureMES objects.
-        """
+    def read_num_errors(self):
+        return int(self._read("MES_Num_Errors"))
+
+    def read_warehouse_inventory(self):
+        w1 = int(self._read("MES_Warehouse_Inventory.N_Pieces_W1"))
+        w2 = int(self._read("MES_Warehouse_Inventory.N_Pieces_W2"))
+        return {"W1": w1, "W2": w2}
+
+    def read_procedures(self, max_slots=10):
         results = []
-        base = f"{GVL_PREFIX}.MES_Procedures"
         for i in range(max_slots):
             try:
-                status       = int(self._read(f"{base}[{i}].Status"))
-                id_proc      = int(self._read(f"{base}[{i}].ID_Procedure"))
-                abort        = bool(self._read(f"{base}[{i}].Successfully_Abort"))
-                results.append(ProcedureMES(status, id_proc, abort))
+                status  = int(self._read(f"MES_Procedures[{i}].Status"))
+                id_proc = int(self._read(f"MES_Procedures[{i}].ID_Procedure"))
+                aborted = bool(self._read(f"MES_Procedures[{i}].Successfully_Abort"))
+                if status == 0 and id_proc == 0:
+                    break
+                results.append({"status": status, "id": id_proc, "aborted": aborted})
             except Exception:
-                break   # end of accessible array
+                break
         return results
 
-    # ── Errors (read from PLC) ─────────────────
-
-    def read_errors(self) -> list[ErrorLog]:
-        """
-        Read MES_Errors up to MES_Num_Errors entries.
-        Returns a list of ErrorLog objects.
-        """
+    def read_errors(self):
         n = self.read_num_errors()
         errors = []
-        base = f"{GVL_PREFIX}.MES_Errors"
-        for i in range(n):
+        for i in range(min(n, 20)):
             try:
-                code     = int(self._read(f"{base}[{i}].Error_Code"))
-                slot     = int(self._read(f"{base}[{i}].Slot_Index"))
-                id_proc  = int(self._read(f"{base}[{i}].ID_Procedure"))
-                errors.append(ErrorLog(code, slot, id_proc))
-            except Exception as e:
-                logger.warning(f"Error reading error slot {i}: {e}")
+                code    = int(self._read(f"MES_Errors[{i}].Error_Code"))
+                slot    = int(self._read(f"MES_Errors[{i}].Slot_Index"))
+                id_proc = int(self._read(f"MES_Errors[{i}].ID_Procedure"))
+                errors.append({"code": code, "slot": slot, "procedure_id": id_proc})
+            except Exception:
                 break
         return errors
 
-    # ── Warehouse inventory ────────────────────
 
-    def read_warehouse_inventory(self) -> WarehouseInventory:
-        """Read MES_Warehouse_Inventory (piece counts in W1 and W2)."""
-        base = f"{GVL_PREFIX}.MES_Warehouse_Inventory"
-        n_w1 = int(self._read(f"{base}.N_Pieces_W1"))
-        n_w2 = int(self._read(f"{base}.N_Pieces_W2"))
-        return WarehouseInventory(N_Pieces_W1=n_w1, N_Pieces_W2=n_w2)
+# ── Self-test ─────────────────────────────────────────────────────────────────
 
-    # ── Piece tracking (route steps) ──────────
-
-    def _read_piece_tracking(self, node_path: str) -> PieceTracking:
-        p = PieceTracking()
-        p.State_Step     = int(self._read(f"{node_path}.State_Step"))
-        p.Conveyor       = bool(self._read(f"{node_path}.Conveyor"))
-        p.ID_Piece       = int(self._read(f"{node_path}.ID_Piece"))
-        p.ID_Procedure   = int(self._read(f"{node_path}.ID_Procedure"))
-        p.Piece_Material = int(self._read(f"{node_path}.Piece_Material"))
-        p.Piece_Type     = int(self._read(f"{node_path}.Piece_Type"))
-        p.Cell_1_conv    = int(self._read(f"{node_path}.Cell_1_conv"))
-        p.Cell_2_conv    = int(self._read(f"{node_path}.Cell_2_conv"))
-        return p
-
-    def read_route_steps_cell(self, cell: int) -> dict:
-        """
-        Read MES_Route_Steps_C<cell> (cell = 1..4).
-        Returns dict with 'W1_C' (PieceTracking) and 'C_W2' (list of PieceTracking).
-        """
-        assert 1 <= cell <= 4
-        base = f"{GVL_PREFIX}.MES_Route_Steps_C{cell}"
-        result = {}
-        result["W1_C"] = self._read_piece_tracking(f"{base}.W1_C")
-        result["C_W2"] = []
-        for i in range(5):
-            try:
-                result["C_W2"].append(self._read_piece_tracking(f"{base}.C_W2[{i}]"))
-            except Exception:
-                break
-        return result
-
-    def read_route_steps_T(self) -> dict:
-        """Read MES_Route_Steps_T (W2_T and T_W1 array)."""
-        base = f"{GVL_PREFIX}.MES_Route_Steps_T"
-        result = {}
-        result["W2_T"] = self._read_piece_tracking(f"{base}.W2_T")
-        result["T_W1"] = []
-        for i in range(5):
-            try:
-                result["T_W1"].append(self._read_piece_tracking(f"{base}.T_W1[{i}]"))
-            except Exception:
-                break
-        return result
-
-    def read_route_steps_L(self) -> PieceTracking:
-        """Read MES_Route_Steps_L (single ST_Piece_Tracking)."""
-        return self._read_piece_tracking(f"{GVL_PREFIX}.MES_Route_Steps_L")
-
-    # ── Tool tracking ──────────────────────────
-
-    def read_tool_track(self, cell: int) -> dict:
-        """
-        Read MES_Tool_Track_C<cell>.
-        Returns dict with Work_Station_1/2/3 enum int values.
-        """
-        assert 1 <= cell <= 4
-        base = f"{GVL_PREFIX}.MES_Tool_Track_C{cell}"
-        return {
-            "Work_Station_1": int(self._read(f"{base}.Work_Station_1")),
-            "Work_Station_2": int(self._read(f"{base}.Work_Station_2")),
-            "Work_Station_3": int(self._read(f"{base}.Work_Station_3")),
-        }
-
-    def read_tool_change_track(self, cell: int) -> dict:
-        """Read MES_Tool_Change_Track_C<cell>. Returns dict with Station_1/2/3 bools."""
-        assert 1 <= cell <= 4
-        base = f"{GVL_PREFIX}.MES_Tool_Change_Track_C{cell}"
-        return {
-            "Station_1": bool(self._read(f"{base}.Station_1")),
-            "Station_2": bool(self._read(f"{base}.Station_2")),
-            "Station_3": bool(self._read(f"{base}.Station_3")),
-        }
-
-    def read_work_track(self, cell: int) -> dict:
-        """Read MES_Work_Track_C<cell> (workstation busy/done flags)."""
-        assert 1 <= cell <= 4
-        base = f"{GVL_PREFIX}.MES_Work_Track_C{cell}"
-        return {
-            "Working_Station_1":   bool(self._read(f"{base}.Working_Station_1")),
-            "Work_Done_Station_1": bool(self._read(f"{base}.Work_Done_Station_1")),
-            "Working_Station_2":   bool(self._read(f"{base}.Working_Station_2")),
-            "Work_Done_Station_2": bool(self._read(f"{base}.Work_Done_Station_2")),
-            "Working_Station_3":   bool(self._read(f"{base}.Working_Station_3")),
-            "Work_Done_Station_3": bool(self._read(f"{base}.Work_Done_Station_3")),
-            "N_Legs_3":            int(self._read(f"{base}.N_Legs_3")),
-            "N_Tops_3":            int(self._read(f"{base}.N_Tops_3")),
-        }
-
-    # ── Convenience: snapshot of everything ───
-
-    def read_full_status(self) -> dict:
-        """
-        Returns a dict snapshot of all MES-relevant readable variables.
-        Useful for logging/DB storage.
-        """
-        status = {
-            "success":            self.read_success(),
-            "num_errors":         self.read_num_errors(),
-            "errors":             self.read_errors(),
-            "warehouse":          self.read_warehouse_inventory(),
-            "procedures":         self.read_procedures(),
-            "route_steps_L":      self.read_route_steps_L(),
-            "route_steps_T":      self.read_route_steps_T(),
-        }
-        for c in range(1, 5):
-            status[f"route_steps_C{c}"]      = self.read_route_steps_cell(c)
-            status[f"tool_track_C{c}"]        = self.read_tool_track(c)
-            status[f"tool_change_track_C{c}"] = self.read_tool_change_track(c)
-            status[f"work_track_C{c}"]        = self.read_work_track(c)
-        return status
-
-
-# ──────────────────────────────────────────────
-# Quick self-test (run directly)
-# ──────────────────────────────────────────────
 if __name__ == "__main__":
     import getpass
-    username = input("CODESYS OPC UA username (leave blank for anonymous): ").strip() or None
+
+    print("=== Recipe builder test (no PLC needed) ===")
+    slots = build_recipe(
+        piece_type="RWW",
+        id_recipe=10,
+        id_procedure_start=101,
+        id_piece_start=60001,
+        id_final_piece=60100,
+    )
+    print(f"Built {len(slots)} slots for RWW:")
+    for i, s in enumerate(slots):
+        print(f"  [{i:2d}] ID_Proc={s['ID_Procedure']:4d} "
+              f"Cell={s['Cell']:4d} Tool={s['Tool']:2d} "
+              f"Time={s['Tool_Time_Sec']:3d}s "
+              f"Asm={str(s['For_Assembly']):5s} "
+              f"Type={s['Piece_Type']:2d}")
+
+    print("\n=== OPC-UA test ===")
+    username = input("Username (blank=anonymous): ").strip() or None
     password = getpass.getpass("Password: ").strip() if username else None
 
-    handler = OPCUAHandler(username=username, password=password)
-
-    if not handler.connect():
-        print("Could not connect to OPC UA server. Is CODESYS running?")
-        sys.exit(1)
-
+    h = OpcUaHandler(username=username, password=password)
     try:
-        while True:
-            print("\n--- MES Status Snapshot ---")
-            print(f"  Success flag  : {handler.read_success()}")
-            print(f"  Num errors    : {handler.read_num_errors()}")
-            inv = handler.read_warehouse_inventory()
-            print(f"  Warehouse W1  : {inv.N_Pieces_W1} pieces")
-            print(f"  Warehouse W2  : {inv.N_Pieces_W2} pieces")
-            errors = handler.read_errors()
-            if errors:
-                print(f"  Errors        : {errors}")
-            time.sleep(2)
+        h.connect()
+        print(f"Warehouse: {h.read_warehouse_inventory()}")
+        print(f"Errors   : {h.read_errors()}")
+
+        ok = h.dispatch(slots)
+        print(f"\nResult: {'PASS' if ok else 'FAIL'}")
+        print(f"MES_Success: {h.read_success()}")
+        print(f"Errors     : {h.read_errors()}")
+        print(f"Procedures : {h.read_procedures()}")
 
     except KeyboardInterrupt:
-        print("\nStopping...")
+        pass
     finally:
-        handler.disconnect()
+        h.disconnect()
