@@ -65,15 +65,16 @@ class ActiveOrder:
     status: str = "PENDING"
     priority: float = 0.0
     started_at: float = 0.0
+    db_order_id: int = None
 
     @property
-    def remaining_quantity(self):
+    def quantity_remaining(self):
         return self.quantity - self.quantity_done
     
     @property
     def estimated_time_remaining(self):
-        return self.remaining_quantity * ESTIMATED_TIME.get(self.piece_type, 0)
-    
+        return self.quantity_remaining * ESTIMATED_TIME.get(self.piece_type, 0)
+        
     def calculate_priority(self, in_progress_boost: float) -> float:
         t = self.estimated_time_remaining 
         if t == 0:

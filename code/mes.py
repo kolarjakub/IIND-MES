@@ -20,9 +20,9 @@ class MES:
         # PLC interface
         self._plc = PLCInterface()
 
-        # Order receiver — callbacks: MES intake + DB save
+        # Order receiver — single callback handles DB save + active list
         self._order_receiver = orc.OrderReceiver(
-            on_order_received=[self._add_order_to_active_list, dbh.save_to_db]
+            on_order_received=[self._add_order_to_active_list]
         )
 
         # Warehouse local tracking
@@ -32,13 +32,35 @@ class MES:
         # Active orders list — PENDING and IN_PROGRESS
         self._active_orders_list = list()
 
-        # Lock to protect active orders list from race conditions
+        # Lock to protect shared state from race conditions
         self._lock = threading.Lock()
+
+        # Dock assignment — cycles 1->2->3->4->5->1
+        self._next_dock = 1
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
     def run(self):
         """Start MES — connect to PLC, sync warehouse, start all threads."""
+        # Reload any unfinished orders from DB on startup
+        for row in dbh.get_pending_orders():
+            active = ord.ActiveOrder(
+                client_order_id = 0,
+                piece_type      = row['type'],
+                quantity        = row['quantity'],
+                ddate_days      = row['DDate'],
+                penalty         = row['penalty'],
+                status          = "PENDING",
+                db_order_id     = row['order_id'],
+            )
+            active.calculate_priority(in_progress_boost=1.5)
+            self._active_orders_list.append(active)
+
+        if self._active_orders_list:
+            print(f"{Fore.CYAN}[MES] Reloaded "
+                  f"{len(self._active_orders_list)} pending order(s) from DB"
+                  f"{Style.RESET_ALL}")
+
         print(f"{Fore.GREEN}[MES] Starting...{Style.RESET_ALL}")
 
         # Connect to PLC
@@ -82,7 +104,6 @@ class MES:
         while True:
             time.sleep(SCHEDULING_INTERVAL)
             with self._lock:
-                # Get all pending orders
                 pending = [o for o in self._active_orders_list
                            if o.status == "PENDING"]
 
@@ -126,13 +147,19 @@ class MES:
     # ── Order intake ──────────────────────────────────────────────────────────
 
     def _add_order_to_active_list(self, client_order):
-        """Callback from OrderReceiver — splits ClientOrder into ActiveOrders."""
+        """Callback from OrderReceiver — saves to DB and creates ActiveOrders."""
+        order_ids = dbh.save_to_db(client_order)
+        if not order_ids:
+            order_ids = []
+
         with self._lock:
-            for order in client_order.orders:
+            for i, order in enumerate(client_order.orders):
                 if order.type not in ord.VALID_TYPES:
                     print(f"{Fore.RED}[MES] Unknown type {order.type}, "
                           f"skipping{Style.RESET_ALL}")
                     continue
+
+                db_id = order_ids[i] if i < len(order_ids) else None
 
                 active_order = ord.ActiveOrder(
                     client_order_id = client_order.OrderID,
@@ -140,12 +167,15 @@ class MES:
                     quantity        = order.quantity,
                     ddate_days      = order.DDate,
                     penalty         = order.Penalty,
+                    status          = "PENDING",
+                    db_order_id     = db_id,
                 )
                 active_order.calculate_priority(in_progress_boost=1.5)
                 self._active_orders_list.append(active_order)
                 print(
                     f"{Fore.GREEN}[MES] Queued {order.quantity}x {order.type} "
-                    f"| priority={active_order.priority:.3f}{Style.RESET_ALL}"
+                    f"| priority={active_order.priority:.3f} "
+                    f"| db_id={db_id}{Style.RESET_ALL}"
                 )
 
     # ── Warehouse sync ────────────────────────────────────────────────────────
@@ -182,6 +212,63 @@ class MES:
         except Exception as e:
             print(f"{Fore.RED}[MES] Could not sync warehouse: {e}{Style.RESET_ALL}")
 
+    # ── ERP interface — called directly by ERP ────────────────────────────────
+
+    def add_materials(self, wood: int = 0, metal: int = 0):
+        """
+        Called by ERP to notify MES that raw materials have been loaded into W1.
+
+        The ERP calls this after purchasing from a supplier and the materials
+        arrive at the loading cell L. MES updates its W1 tracking accordingly
+        so the scheduler can dispatch pending orders.
+
+        Args:
+            wood:  number of Wood pieces added to W1
+            metal: number of Metal pieces added to W1
+        """
+        if wood < 0 or metal < 0:
+            print(f"{Fore.RED}[MES] add_materials: negative values not allowed"
+                  f"{Style.RESET_ALL}")
+            return
+
+        with self._lock:
+            self._warehouse_W1.wood  += wood
+            self._warehouse_W1.metal += metal
+
+        print(
+            f"{Fore.GREEN}[MES] Materials added: +{wood} Wood +{metal} Metal "
+            f"| W1 now: Wood={self._warehouse_W1.wood} "
+            f"Metal={self._warehouse_W1.metal}{Style.RESET_ALL}"
+        )
+
+    def get_status(self) -> dict:
+        """
+        Called by ERP to get a snapshot of MES state.
+
+        Returns dict with:
+            warehouse_W1: {"wood": int, "metal": int}
+            warehouse_W2: {"wood": int, "metal": int}
+            pending:      number of pending orders
+            in_progress:  number of in-progress orders
+            completed:    number of completed orders
+            plc_ready:    bool
+        """
+        with self._lock:
+            pending     = sum(1 for o in self._active_orders_list if o.status == "PENDING")
+            in_progress = sum(1 for o in self._active_orders_list if o.status == "IN_PROGRESS")
+            completed   = sum(1 for o in self._active_orders_list if o.status == "COMPLETED")
+
+        return {
+            "warehouse_W1": {"wood": self._warehouse_W1.wood,
+                             "metal": self._warehouse_W1.metal},
+            "warehouse_W2": {"wood": self._warehouse_W2.wood,
+                             "metal": self._warehouse_W2.metal},
+            "pending":      pending,
+            "in_progress":  in_progress,
+            "completed":    completed,
+            "plc_ready":    self._plc.is_ready(),
+        }
+
     # ── Scheduling helpers ────────────────────────────────────────────────────
 
     def _can_dispatch(self, order: ord.ActiveOrder) -> bool:
@@ -192,29 +279,46 @@ class MES:
         w2_space = (self._warehouse_W2.total + order.quantity_remaining) <= WAREHOUSE_CAPACITY
         return wood_ok and metal_ok and w2_space
 
-    def _dispatch(self, order: ord.ActiveOrder):
-        """Send order to PLC and update order status."""
-        print(f"{Fore.CYAN}[MES] Dispatching {order.quantity_remaining}x "
-              f"{order.piece_type}...{Style.RESET_ALL}")
+    def _get_next_dock(self) -> int:
+        """Assign next available unloading dock, cycling 1-5."""
+        dock = self._next_dock
+        self._next_dock = (self._next_dock % 5) + 1
+        return dock
 
-        success = self._plc.create_pieces(
-            order.piece_type,
-            order.quantity_remaining
-        )
+    def _dispatch(self, order: ord.ActiveOrder):
+        """Send order to PLC with dock assignment and update order status."""
+        qty  = order.quantity_remaining
+        dock = self._get_next_dock()
+
+        print(f"{Fore.CYAN}[MES] Dispatching {qty}x {order.piece_type} "
+              f"-> dock {dock}...{Style.RESET_ALL}")
+
+        # Use unload_order for large quantities (auto-splits across docks)
+        # Use create_pieces_for_unload for <= 6 pieces (single dock)
+        if qty <= 6:
+            success = self._plc.create_pieces_for_unload(
+                order.piece_type, qty, dock=dock
+            )
+        else:
+            success = self._plc.unload_order(order.piece_type, qty)
 
         if success:
             order.status     = "IN_PROGRESS"
             order.started_at = time.time()
+            order.dock       = dock
             order.calculate_priority(in_progress_boost=1.5)
+
+            if order.db_order_id is not None:
+                dbh.update_order_status(order.db_order_id, "IN_PROGRESS")
 
             # Deduct materials from W1 tracking
             needed = ord.RAW_MATERIALS[order.piece_type]
-            self._warehouse_W1.wood  -= needed.get("Wood",  0) * order.quantity_remaining
-            self._warehouse_W1.metal -= needed.get("Metal", 0) * order.quantity_remaining
+            self._warehouse_W1.wood  -= needed.get("Wood",  0) * qty
+            self._warehouse_W1.metal -= needed.get("Metal", 0) * qty
 
             print(
-                f"{Fore.GREEN}[MES] Dispatched {order.quantity_remaining}x "
-                f"{order.piece_type} | "
+                f"{Fore.GREEN}[MES] Dispatched {qty}x {order.piece_type} "
+                f"-> dock {dock} | "
                 f"W1 remaining: Wood={self._warehouse_W1.wood} "
                 f"Metal={self._warehouse_W1.metal}{Style.RESET_ALL}"
             )
@@ -228,10 +332,23 @@ class MES:
         """Poll PLC for completed procedures and update order statuses."""
         try:
             procedures = self._plc.get_procedures()
-            if procedures:
-                print(f"[MES] Active procedures: {len(procedures)}")
-            # TODO: match completed procedures to active orders
-            # and call _complete_order() when done
+
+            with self._lock:
+                in_progress = [o for o in self._active_orders_list
+                               if o.status == "IN_PROGRESS"]
+
+                if in_progress:
+                    if not procedures:
+                        # PLC idle — all IN_PROGRESS orders are done
+                        print(f"{Fore.GREEN}[MES] PLC idle — "
+                              f"marking {len(in_progress)} order(s) complete"
+                              f"{Style.RESET_ALL}")
+                        for order in in_progress:
+                            self._complete_order(order)
+                    else:
+                        print(f"[MES] Waiting for PLC — "
+                              f"{len(procedures)} procedure(s) still active")
+
         except Exception as e:
             print(f"{Fore.RED}[MES] Status poll failed: {e}{Style.RESET_ALL}")
 
@@ -239,13 +356,21 @@ class MES:
         """Mark order as completed, update warehouse tracking, update DB."""
         order.status        = "COMPLETED"
         order.quantity_done = order.quantity
+        dock = getattr(order, "dock", "?")
 
         print(
-            f"{Fore.GREEN}[MES] Completed {order.quantity}x "
-            f"{order.piece_type}{Style.RESET_ALL}"
+            f"{Fore.GREEN}"
+            f"╔══════════════════════════════════════╗\n"
+            f"║  ORDER COMPLETED                     ║\n"
+            f"║  Type    : {order.piece_type:<26}║\n"
+            f"║  Quantity: {order.quantity:<26}║\n"
+            f"║  Dock    : {str(dock):<26}║\n"
+            f"╚══════════════════════════════════════╝"
+            f"{Style.RESET_ALL}"
         )
-        # TODO: update DB
-        # dbh.db_update_order_status(order.client_order_id, "COMPLETED")
+
+        if order.db_order_id is not None:
+            dbh.update_order_status(order.db_order_id, "COMPLETED")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

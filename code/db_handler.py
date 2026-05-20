@@ -151,11 +151,10 @@ def db_init():
 # ERP / order queries  (original logic, kept intact)
 # ---------------------------------------------------------------------------
 
-_insert_client_q = """
-    INSERT INTO mes.clients (name, nif)
-    VALUES (%s, %s)
-    ON CONFLICT (name, nif) DO UPDATE SET name = EXCLUDED.name
-    RETURNING client_id;
+_insert_order_q = """
+    INSERT INTO mes.orders (client_order_id, type, quantity, DDate, penalty, priority, status)
+    VALUES (%s, %s, %s, %s, %s, %s, 'PENDING')
+    RETURNING order_id;
 """
 
 _insert_client_order_q = """
@@ -164,11 +163,17 @@ _insert_client_order_q = """
     ON CONFLICT (external_order_id, client_id) DO NOTHING
     RETURNING client_order_id;
 """
-
-_insert_order_q = """
-    INSERT INTO mes.orders (client_order_id, type, quantity, DDate, penalty, priority, status)
-    VALUES (%s, %s, %s, %s, %s, %s, 'PENDING');
+_insert_client_q = """
+    INSERT INTO mes.clients (name, nif)
+    VALUES (%s, %s)
+    ON CONFLICT (name, nif) DO UPDATE SET name = EXCLUDED.name
+    RETURNING client_id;
 """
+
+# _insert_order_q = """
+#     INSERT INTO mes.orders (client_order_id, type, quantity, DDate, penalty, priority, status)
+#     VALUES (%s, %s, %s, %s, %s, %s, 'PENDING');
+# """
 
 
 def save_to_db(client_order):
@@ -203,14 +208,19 @@ def save_to_db(client_order):
             client_order_id = cursor.fetchone()[0]
 
         # insert order lines
+        order_ids = []
         for item in getattr(client_order, 'orders', []):
             cursor.execute(_insert_order_q,
                            (client_order_id, item.type, item.quantity,
                             item.DDate, item.Penalty,
                             getattr(item, 'priority', None)))
+            row = cursor.fetchone()
+            if row:
+                order_ids.append(row[0])
 
         connection.commit()
         print(f"Saved client order {client_order.OrderID} to DB.")
+        return order_ids
     except Exception as e:
         print(f"Error saving order: {e}")
         try:

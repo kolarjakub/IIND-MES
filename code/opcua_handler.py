@@ -540,15 +540,30 @@ class OpcUaHandler:
         return {"W1": w1, "W2": w2}
 
     def read_procedures(self, max_slots=10):
+        """
+        Read active MES_Procedures — excludes IDLE (0) and COMPLETED (4).
+        Returns only procedures genuinely in progress.
+
+        E_Procedure_Status: IDLE=0, NEW_ORDER=1, EXECUTION=2, STOPPED=3, COMPLETED=4
+        """
         results = []
         for i in range(max_slots):
             try:
                 status  = int(self._read(f"MES_Procedures[{i}].Status"))
                 id_proc = int(self._read(f"MES_Procedures[{i}].ID_Procedure"))
                 aborted = bool(self._read(f"MES_Procedures[{i}].Successfully_Abort"))
-                if status == 0 and id_proc == 0:
+
+                # Stop at empty slot
+                if id_proc == 0:
                     break
-                results.append({"status": status, "id": id_proc, "aborted": aborted})
+
+                # Only include active procedures (not IDLE=0 or COMPLETED=4)
+                if status not in (0, 4):
+                    results.append({
+                        "status":  status,
+                        "id":      id_proc,
+                        "aborted": aborted,
+                    })
             except Exception:
                 break
         return results
