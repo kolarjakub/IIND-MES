@@ -1,0 +1,21 @@
+========================================================
+  RECIPE TEST RESULTS
+  Date    : 2026-05-23 22:47:05
+  Mode    : AUTO
+  Material: mes_inject
+  Repeats : 1
+========================================================
+
+RESULTS:
+  Product  Cell Result
+  ──────── ──── ──────────
+  RWW      C1   ABORTED
+  SWW      C2   NOT RUN
+  RWM      C1   NOT RUN
+  RWM      C4   NOT RUN
+  SWM      C2   NOT RUN
+  SWM      C4   NOT RUN
+  RMM      C3   NOT RUN
+  SMM      C3   NOT RUN
+
+  Total=1  PASS=0  FAIL=0  SKIPPED=0

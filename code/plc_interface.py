@@ -25,20 +25,17 @@ Static helpers (no connection needed):
 
 from opcua_handler import OpcUaHandler, build_recipe, ELocation
 
+# RWM and SWM removed — not yet implemented in PLC (multi-cell required)
 ESTIMATED_TIME = {
-    "RWW": 60,
-    "SWW": 50,
-    "RWM": 100,
-    "SWM": 90,
-    "RMM": 105,
-    "SMM": 95,
+    "RWW": 60,   # C1: legs 10+10s, top 30s
+    "SWW": 50,   # C2: legs 10+10s, top 20s
+    "RMM": 105,  # C3: legs 30+30s, top 35s
+    "SMM": 95,   # C4: legs 30+30s, top 25s
 }
 
 RAW_MATERIALS = {
     "RWW": {"Wood": 3, "Metal": 0},
     "SWW": {"Wood": 3, "Metal": 0},
-    "RWM": {"Wood": 1, "Metal": 2},
-    "SWM": {"Wood": 1, "Metal": 2},
     "RMM": {"Wood": 0, "Metal": 3},
     "SMM": {"Wood": 0, "Metal": 3},
 }
@@ -100,10 +97,18 @@ class PLCInterface:
             return True
 
     def get_warehouse_status(self):
+        """
+        Returns warehouse status with type-aware breakdown.
+        W1_wood/W1_metal = RAW materials only (schedulable)
+        W1_wip = work-in-progress pieces (not schedulable)
+        W2_finished = completed tables waiting to unload
+        """
         try:
             return self._handler.read_warehouse_inventory()
         except Exception:
-            return {"W1": 0, "W2": 0}
+            return {"W1": 0, "W2": 0,
+                    "W1_wood": 0, "W1_metal": 0,
+                    "W2_finished": 0}
 
     def get_errors(self):
         try:
@@ -116,6 +121,20 @@ class PLCInterface:
             return self._handler.read_procedures()
         except Exception:
             return []
+
+    def get_cell_availability(self, cell: str) -> dict:
+        """
+        Check if a cell has free workstations.
+        cell: "C1", "C2", "C3", or "C4"
+        Returns dict with any_free, all_busy, working[], done[]
+        """
+        try:
+            return self._handler.read_cell_workstation_tracking(cell)
+        except Exception:
+            # If we can't read, assume free (conservative — better than blocking)
+            return {"any_free": True, "all_busy": False,
+                    "working": [False, False, False],
+                    "done":    [False, False, False]}
 
     def get_status(self):
         return {

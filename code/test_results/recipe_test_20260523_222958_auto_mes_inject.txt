@@ -1,0 +1,37 @@
+========================================================
+  RECIPE TEST RESULTS
+  Date    : 2026-05-23 22:29:58
+  Mode    : AUTO
+  Material: mes_inject
+  Repeats : 3
+========================================================
+
+RESULTS:
+  Product  Cell Result
+  ──────── ──── ──────────
+  RWW      C1   PASS
+  SWW      C2   PASS
+  RWM      C1   ABORTED
+  RWM      C4   NOT RUN
+  SWM      C2   NOT RUN
+  SWM      C4   NOT RUN
+  RMM      C3   NOT RUN
+  SMM      C3   NOT RUN
+
+  Total=3  PASS=2  FAIL=0  SKIPPED=0
+
+TIMING:
+  Product  Cell Times                        Avg  Estimate   Diff
+  ──────── ──── ───────────────────────── ────── ───────── ──────
+  RWW      C1   126s 96s 65s                 96s       60s    +36s
+  SWW      C2   115s 86s 56s                 86s       50s    +36s
+
+SUGGESTED ESTIMATED_TIME:
+  ESTIMATED_TIME = {
+      "RWW": 96,  # was 60s
+      "SWW": 86,  # was 50s
+      "RWM": 100,  # not tested
+      "SWM": 90,  # not tested
+      "RMM": 105,  # not tested
+      "SMM": 95,  # not tested
+  }

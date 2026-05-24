@@ -14,6 +14,15 @@ SCHEDULING_INTERVAL = 5.0   # seconds between scheduler ticks
 STATUS_INTERVAL     = 2.0   # seconds between PLC status polls
 WAREHOUSE_CAPACITY  = 32    # max pieces per warehouse (from spec)
 
+# Which cell each product type uses (confirmed from Final_Test PLC code)
+# RWM/SWM removed — not implemented in PLC yet (require multi-cell machining)
+CELL_MAP = {
+    "RWW": "C1",
+    "SWW": "C2",
+    "RMM": "C3",
+    "SMM": "C4",
+}
+
 
 class MES:
     def __init__(self):
@@ -103,6 +112,10 @@ class MES:
         """Thread: every SCHEDULING_INTERVAL seconds, dispatch highest priority order."""
         while True:
             time.sleep(SCHEDULING_INTERVAL)
+
+            # Reconcile warehouse with PLC before scheduling
+            self._reconcile_warehouse()
+
             with self._lock:
                 pending = [o for o in self._active_orders_list
                            if o.status == "PENDING"]
@@ -115,13 +128,31 @@ class MES:
                     o.calculate_priority(in_progress_boost=1.5)
                 pending.sort(key=lambda o: o.priority, reverse=True)
 
-                # Try to dispatch highest priority dispatchable order
-                dispatched = False
+                # Try to dispatch one order per available cell (parallel dispatch)
+                # e.g. RWW to C1 AND RMM to C3 in same tick
+                dispatched_cells = set()
+                dispatched_any   = False
+
                 for order in pending:
+                    cell = CELL_MAP.get(order.piece_type)
+
+                    # Skip if we already dispatched to this cell this tick
+                    if cell in dispatched_cells:
+                        continue
+
+                    # Check if cell has free workstations
+                    cell_avail = self._plc.get_cell_availability(cell)
+                    if not cell_avail["any_free"]:
+                        print(
+                            f"{Fore.YELLOW}[MES] Cell {cell} full "
+                            f"— skipping {order.piece_type}{Style.RESET_ALL}"
+                        )
+                        continue
+
                     if self._can_dispatch(order):
                         self._dispatch(order)
-                        dispatched = True
-                        break
+                        dispatched_cells.add(cell)
+                        dispatched_any = True
                     else:
                         needed = ord.RAW_MATERIALS[order.piece_type]
                         print(
@@ -134,9 +165,9 @@ class MES:
                             f"{Style.RESET_ALL}"
                         )
 
-                if not dispatched and pending:
+                if not dispatched_any and pending:
                     print(f"{Fore.YELLOW}[MES] No orders dispatchable "
-                          f"— waiting for materials{Style.RESET_ALL}")
+                          f"— waiting for materials or free cells{Style.RESET_ALL}")
 
     def _status_loop(self):
         """Thread: every STATUS_INTERVAL seconds, poll PLC for completed procedures."""
@@ -181,33 +212,24 @@ class MES:
     # ── Warehouse sync ────────────────────────────────────────────────────────
 
     def _sync_warehouse_state(self):
-        """Read warehouse counts from PLC on startup."""
+        """Read warehouse counts from PLC on startup — type-aware breakdown."""
         try:
-            status   = self._plc.get_warehouse_status()
-            total_w1 = status["W1"]
-            total_w2 = status["W2"]
+            status     = self._plc.get_warehouse_status()
+            total_w1   = status["W1"]
+            total_w2   = status["W2"]
+            w1_wood    = status.get("W1_wood",     0)
+            w1_metal   = status.get("W1_metal",    0)
+            w2_finished= status.get("W2_finished", 0)
 
-            if total_w1 == 0:
-                self._warehouse_W1 = ord.WarehouseState(wood=0, metal=0)
-            else:
-                print(
-                    f"{Fore.YELLOW}[MES] W1 has {total_w1} pieces from previous "
-                    f"session — material type unknown, assuming empty"
-                    f"{Style.RESET_ALL}"
-                )
-                self._warehouse_W1 = ord.WarehouseState(wood=0, metal=0)
+            self._warehouse_W1 = ord.WarehouseState(wood=w1_wood,    metal=w1_metal)
+            self._warehouse_W2 = ord.WarehouseState(wood=w2_finished, metal=0)
 
-            if total_w2 == 0:
-                self._warehouse_W2 = ord.WarehouseState(wood=0, metal=0)
-            else:
-                print(
-                    f"{Fore.YELLOW}[MES] W2 has {total_w2} pieces from previous "
-                    f"session{Style.RESET_ALL}"
-                )
-                self._warehouse_W2 = ord.WarehouseState(wood=0, metal=0)
-
-            print(f"{Fore.GREEN}[MES] Warehouse synced: "
-                  f"W1={total_w1} W2={total_w2}{Style.RESET_ALL}")
+            print(
+                f"{Fore.GREEN}[MES] Warehouse synced: "
+                f"W1={total_w1} (Wood={w1_wood} Metal={w1_metal}) "
+                f"W2={total_w2} (Finished={w2_finished})"
+                f"{Style.RESET_ALL}"
+            )
 
         except Exception as e:
             print(f"{Fore.RED}[MES] Could not sync warehouse: {e}{Style.RESET_ALL}")
@@ -258,18 +280,73 @@ class MES:
             in_progress = sum(1 for o in self._active_orders_list if o.status == "IN_PROGRESS")
             completed   = sum(1 for o in self._active_orders_list if o.status == "COMPLETED")
 
+            pending_orders = [
+                {"piece_type": o.piece_type, "quantity": o.quantity_remaining,
+                 "client_order_id": o.client_order_id, "status": "PENDING"}
+                for o in self._active_orders_list if o.status == "PENDING"
+            ]
+            in_progress_orders = [
+                {"piece_type": o.piece_type, "quantity": o.quantity_remaining,
+                 "client_order_id": o.client_order_id, "status": "IN_PROGRESS",
+                 "dock": getattr(o, "dock", "?")}
+                for o in self._active_orders_list if o.status == "IN_PROGRESS"
+            ]
+
         return {
-            "warehouse_W1": {"wood": self._warehouse_W1.wood,
-                             "metal": self._warehouse_W1.metal},
-            "warehouse_W2": {"wood": self._warehouse_W2.wood,
-                             "metal": self._warehouse_W2.metal},
-            "pending":      pending,
-            "in_progress":  in_progress,
-            "completed":    completed,
-            "plc_ready":    self._plc.is_ready(),
+            "warehouse_W1":       {"wood": self._warehouse_W1.wood,
+                                   "metal": self._warehouse_W1.metal},
+            "warehouse_W2":       {"wood": self._warehouse_W2.wood,
+                                   "metal": self._warehouse_W2.metal},
+            "pending":            pending,
+            "in_progress":        in_progress,
+            "completed":          completed,
+            "plc_ready":          self._plc.is_ready(),
+            "pending_orders":     pending_orders,
+            "in_progress_orders": in_progress_orders,
         }
 
     # ── Scheduling helpers ────────────────────────────────────────────────────
+
+    def _reconcile_warehouse(self):
+        """
+        Sync MES warehouse tracking with PLC data.
+
+        Strategy:
+        - If PLC has MORE than MES thinks → trust PLC (piece arrived we missed)
+        - If PLC has LESS than MES thinks → keep MES value
+          (ERP simulated delivery — piece not physically in SFS yet but
+           is allocated for production. Reducing would block scheduling.)
+        - If PLC has ZERO and MES > 0 → only reset if we have no pending
+          orders waiting for material (safety check for complete drift)
+        """
+        try:
+            inv       = self._plc.get_warehouse_status()
+            plc_wood  = inv.get("W1_wood",  0)
+            plc_metal = inv.get("W1_metal", 0)
+
+            with self._lock:
+                mes_wood  = self._warehouse_W1.wood
+                mes_metal = self._warehouse_W1.metal
+
+                if plc_wood == mes_wood and plc_metal == mes_metal:
+                    return  # in sync
+
+                # Only correct upward — never reduce simulated ERP stock
+                new_wood  = max(mes_wood,  plc_wood)
+                new_metal = max(mes_metal, plc_metal)
+
+                if new_wood != mes_wood or new_metal != mes_metal:
+                    print(
+                        f"{Fore.YELLOW}[MES] W1 corrected up: "
+                        f"Wood:{mes_wood}→{new_wood} "
+                        f"Metal:{mes_metal}→{new_metal}{Style.RESET_ALL}"
+                    )
+                    self._warehouse_W1 = ord.WarehouseState(
+                        wood=new_wood, metal=new_metal
+                    )
+
+        except Exception as e:
+            print(f"{Fore.RED}[MES] Warehouse reconcile failed: {e}{Style.RESET_ALL}")
 
     def _can_dispatch(self, order: ord.ActiveOrder) -> bool:
         """Check if warehouse has enough material and W2 has space."""
@@ -329,25 +406,69 @@ class MES:
     # ── Status polling ────────────────────────────────────────────────────────
 
     def _poll_plc_status(self):
-        """Poll PLC for completed procedures and update order statuses."""
+        """
+        Poll PLC for completed procedures and update order statuses.
+
+        Sequence:
+          1. Procedures go to 0 — PLC finished processing
+          2. Piece travels conveyor to W2 — takes a few more seconds
+          3. W2 count increases — piece physically arrived
+          4. Mark order complete
+
+        We wait for W2 increase rather than procedures=0 to avoid
+        marking complete before the piece actually arrives.
+        """
         try:
             procedures = self._plc.get_procedures()
+            inv        = self._plc.get_warehouse_status()
+            w2_now     = inv.get("W2", 0)
 
             with self._lock:
                 in_progress = [o for o in self._active_orders_list
                                if o.status == "IN_PROGRESS"]
 
-                if in_progress:
-                    if not procedures:
-                        # PLC idle — all IN_PROGRESS orders are done
-                        print(f"{Fore.GREEN}[MES] PLC idle — "
-                              f"marking {len(in_progress)} order(s) complete"
-                              f"{Style.RESET_ALL}")
-                        for order in in_progress:
-                            self._complete_order(order)
-                    else:
-                        print(f"[MES] Waiting for PLC — "
-                              f"{len(procedures)} procedure(s) still active")
+                if not in_progress:
+                    return
+
+                if procedures:
+                    print(f"[MES] Waiting for PLC — "
+                          f"{len(procedures)} procedure(s) still active")
+                    return
+
+                # Procedures cleared — now wait for W2 to increase
+                # Get total expected pieces from in_progress orders
+                expected_pieces = sum(o.quantity for o in in_progress)
+                w2_baseline = getattr(self, "_w2_baseline", 0)
+
+                if not hasattr(self, "_procedures_cleared_at"):
+                    # First tick with procedures=0 — record W2 baseline
+                    self._procedures_cleared_at = True
+                    self._w2_baseline = w2_now
+                    print(
+                        f"{Fore.YELLOW}[MES] Procedures cleared — "
+                        f"waiting for piece(s) to arrive in W2 "
+                        f"(W2 now={w2_now}){Style.RESET_ALL}"
+                    )
+                    return
+
+                # Check if W2 increased enough
+                new_pieces = w2_now - self._w2_baseline
+                if new_pieces >= expected_pieces:
+                    print(
+                        f"{Fore.GREEN}[MES] Piece(s) arrived in W2 "
+                        f"(+{new_pieces}) — marking {len(in_progress)} "
+                        f"order(s) complete{Style.RESET_ALL}"
+                    )
+                    # Reset tracking
+                    del self._procedures_cleared_at
+                    self._w2_baseline = 0
+                    for order in in_progress:
+                        self._complete_order(order)
+                else:
+                    print(
+                        f"{Fore.YELLOW}[MES] Procedures done, waiting for W2 "
+                        f"(got {new_pieces}/{expected_pieces} pieces){Style.RESET_ALL}"
+                    )
 
         except Exception as e:
             print(f"{Fore.RED}[MES] Status poll failed: {e}{Style.RESET_ALL}")
@@ -371,6 +492,17 @@ class MES:
 
         if order.db_order_id is not None:
             dbh.update_order_status(order.db_order_id, "COMPLETED")
+
+        # Notify ERP so penalty accrual stops
+        if hasattr(self, "_erp") and self._erp is not None:
+            self._erp.mark_order_delivered(order.client_order_id, order.piece_type)
+
+        # Update W2 tracking
+        self._warehouse_W2.wood = max(0, self._warehouse_W2.wood - order.quantity)
+
+    def set_erp(self, erp):
+        """Set reference to ERP instance for order completion callbacks."""
+        self._erp = erp
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

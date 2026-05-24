@@ -110,7 +110,24 @@ class EProcedureStatus:
 # ── Product recipe definitions ────────────────────────────────────────────────
 # Based on Final_Test PLC code and spec Table 3
 
+# ── Product recipes — confirmed from Final_Test PLC code ─────────────────────
+#
+# Cell assignments (from Final_Test, confirmed via Tools_C1/C2/C3/C4):
+#   C1: T1,T2,T3,T8,T9,T11  → RWW (WoodLeg+WoodRoundTop)
+#   C2: T1,T2,T3,T8,T9,T10  → SWW (WoodLeg+WoodSquareTop)
+#   C3: T4,T5,T6,T8,T9,T11  → RMM (MetalLeg+MetalRoundTop)
+#   C4: T4,T5,T6,T8,T9,T10  → SMM (MetalLeg+MetalSquareTop)
+#
+# RWM and SWM are commented out in Final_Test — not yet implemented in PLC.
+# They require multi-cell machining (T5 for metal legs in C3/C4,
+# T1/T2 for wood top in C1/C2). Not supported yet.
+#
+# VALID producible types: RWW, SWW, RMM, SMM
+
 PRODUCT_RECIPES = {
+    # ── Wood Round Table (RWW) — Cell C1 ─────────────────────────────────────
+    # Leg×2 machined with T3 (10s each), Round top with T1 (30s)
+    # Assembly with T8 in C1
     "RWW": {
         "cell":         ELocation.C1,
         "materials":    [EMaterial.WOOD,  EMaterial.WOOD,  EMaterial.WOOD],
@@ -121,10 +138,13 @@ PRODUCT_RECIPES = {
         "asm_tool":     ETool.T8,
         "asm_time":     10,
         "final_type":   EPieceType.WOOD_ROUND_TABLE,
-        "asm_leg1_idx": 0,   # piece[0] = Leg1
-        "asm_leg2_idx": 1,   # piece[1] = Leg2
-        "asm_top_idx":  2,   # piece[2] = Top
+        "asm_leg1_idx": 0,
+        "asm_leg2_idx": 1,
+        "asm_top_idx":  2,
     },
+    # ── Wood Square Table (SWW) — Cell C2 ────────────────────────────────────
+    # Leg×2 machined with T3 (10s each), Square top with T2 (20s)
+    # Assembly with T8 in C2
     "SWW": {
         "cell":         ELocation.C2,
         "materials":    [EMaterial.WOOD,  EMaterial.WOOD,  EMaterial.WOOD],
@@ -139,34 +159,9 @@ PRODUCT_RECIPES = {
         "asm_leg2_idx": 1,
         "asm_top_idx":  2,
     },
-    "RWM": {
-        "cell":         ELocation.C1,
-        "materials":    [EMaterial.METAL, EMaterial.METAL, EMaterial.WOOD],
-        "raw_types":    [EPieceType.METAL_LEG, EPieceType.METAL_LEG, EPieceType.WOOD_ROUND_TOP],
-        "mach_tools":   [ETool.T5, ETool.T5, ETool.T1],
-        "mach_times":   [30, 30, 30],
-        "mach_types":   [EPieceType.METAL_LEG, EPieceType.METAL_LEG, EPieceType.WOOD_ROUND_TOP],
-        "asm_tool":     ETool.T9,
-        "asm_time":     10,
-        "final_type":   EPieceType.WOOD_ROUND_TOP_METAL_LEGS,
-        "asm_leg1_idx": 0,
-        "asm_leg2_idx": 1,
-        "asm_top_idx":  2,
-    },
-    "SWM": {
-        "cell":         ELocation.C2,
-        "materials":    [EMaterial.METAL, EMaterial.METAL, EMaterial.WOOD],
-        "raw_types":    [EPieceType.METAL_LEG, EPieceType.METAL_LEG, EPieceType.WOOD_SQUARE_TOP],
-        "mach_tools":   [ETool.T5, ETool.T5, ETool.T2],
-        "mach_times":   [30, 30, 20],
-        "mach_types":   [EPieceType.METAL_LEG, EPieceType.METAL_LEG, EPieceType.WOOD_SQUARE_TOP],
-        "asm_tool":     ETool.T9,
-        "asm_time":     10,
-        "final_type":   EPieceType.WOOD_SQUARE_TOP_METAL_LEGS,
-        "asm_leg1_idx": 0,
-        "asm_leg2_idx": 1,
-        "asm_top_idx":  2,
-    },
+    # ── Metal Round Table (RMM) — Cell C3 ────────────────────────────────────
+    # MetalLeg×2 machined with T5 (30s each), Round metal top with T4 (35s)
+    # Assembly with T8 in C3
     "RMM": {
         "cell":         ELocation.C3,
         "materials":    [EMaterial.METAL, EMaterial.METAL, EMaterial.METAL],
@@ -181,8 +176,12 @@ PRODUCT_RECIPES = {
         "asm_leg2_idx": 1,
         "asm_top_idx":  2,
     },
+    # ── Metal Square Table (SMM) — Cell C4 ───────────────────────────────────
+    # MetalLeg×2 machined with T5 (30s each), Square metal top with T6 (25s)
+    # Assembly with T8 in C4
+    # NOTE: C4 not C3! C3=RMM, C4=SMM (confirmed from Final_Test slots 78-90)
     "SMM": {
-        "cell":         ELocation.C3,
+        "cell":         ELocation.C4,
         "materials":    [EMaterial.METAL, EMaterial.METAL, EMaterial.METAL],
         "raw_types":    [EPieceType.METAL_LEG, EPieceType.METAL_LEG, EPieceType.METAL_SQUARE_TOP],
         "mach_tools":   [ETool.T5, ETool.T5, ETool.T6],
@@ -195,6 +194,11 @@ PRODUCT_RECIPES = {
         "asm_leg2_idx": 1,
         "asm_top_idx":  2,
     },
+    # ── NOT YET IMPLEMENTED IN PLC ────────────────────────────────────────────
+    # RWM and SWM require multi-cell machining:
+    #   Metal legs → C3/C4 (T5)
+    #   Wood top   → C1/C2 (T1/T2)
+    # Tiago has commented these out in Final_Test — ask before implementing.
 }
 
 
@@ -535,9 +539,68 @@ class OpcUaHandler:
         return int(self._read("MES_Num_Errors"))
 
     def read_warehouse_inventory(self):
-        w1 = int(self._read("MES_Warehouse_Inventory.N_Pieces_W1"))
-        w2 = int(self._read("MES_Warehouse_Inventory.N_Pieces_W2"))
-        return {"W1": w1, "W2": w2}
+        """
+        Read warehouse inventory with material-based counting.
+
+        W1 contains raw and mid-process Wood/Metal pieces — all counted
+        by Piece_Material (1=Wood, 2=Metal) since mid-products are still
+        the same material, just shaped.
+
+        W2 contains finished tables — counted by Type_Piece to distinguish
+        finished from anything else.
+
+        Returns:
+            {
+                "W1": int,            # total pieces in W1 (PLC count)
+                "W2": int,            # total pieces in W2 (PLC count)
+                "W1_wood": int,       # Wood pieces in W1 (raw + mid-process)
+                "W1_metal": int,      # Metal pieces in W1 (raw + mid-process)
+                "W2_finished": int,   # finished tables in W2
+            }
+        """
+        FINISHED_TYPES = {9, 10, 11, 12, 13, 14}
+
+        w1_total = int(self._read("MES_Warehouse_Inventory.N_Pieces_W1"))
+        w2_total = int(self._read("MES_Warehouse_Inventory.N_Pieces_W2"))
+
+        w1_wood = w1_metal = 0
+        w2_finished = 0
+
+        # Read W1 — count by Piece_Material
+        for i in range(min(w1_total + 2, 32)):
+            try:
+                base  = f"MES_Warehouse_Inventory.Rast_N_Pieces_In_W1[{i}]"
+                in_w1 = bool(self._read(f"{base}.Inside_Warhouse_W1"))
+                if not in_w1:
+                    continue
+                mat = int(self._read(f"{base}.Piece_Material"))
+                if mat == 1:
+                    w1_wood += 1
+                elif mat == 2:
+                    w1_metal += 1
+            except Exception:
+                break
+
+        # Read W2 — count finished tables by Type_Piece
+        for i in range(min(w2_total + 2, 32)):
+            try:
+                base  = f"MES_Warehouse_Inventory.Rast_N_Pieces_In_W2[{i}]"
+                in_w2 = bool(self._read(f"{base}.Inside_Warhouse_W2"))
+                if not in_w2:
+                    continue
+                piece_type = int(self._read(f"{base}.Type_Piece"))
+                if piece_type in FINISHED_TYPES:
+                    w2_finished += 1
+            except Exception:
+                break
+
+        return {
+            "W1":          w1_total,
+            "W2":          w2_total,
+            "W1_wood":     w1_wood,
+            "W1_metal":    w1_metal,
+            "W2_finished": w2_finished,
+        }
 
     def read_procedures(self, max_slots=10):
         """
@@ -567,6 +630,45 @@ class OpcUaHandler:
             except Exception:
                 break
         return results
+
+    def read_cell_workstation_tracking(self, cell: str) -> dict:
+        """
+        Read MES_Work_Track_C1/C2/C3/C4 for a given cell.
+        Returns which stations are working and which are done.
+
+        ST_WorkStation_Tracking fields:
+            Working_Station_1/2/3 : BOOL — station currently processing
+            Work_Done_Station_1/2/3: BOOL — station finished current piece
+
+        Args:
+            cell: "C1", "C2", "C3", or "C4"
+
+        Returns dict:
+            {
+                "working": [bool, bool, bool],   # stations 1,2,3 busy
+                "done":    [bool, bool, bool],   # stations 1,2,3 done
+                "any_free": bool,                # at least one station free
+                "all_busy": bool,                # all stations busy
+            }
+        """
+        base = f"MES_Work_Track_{cell}"
+        working = []
+        done    = []
+        for i in range(1, 4):
+            try:
+                w = bool(self._read(f"{base}.Working_Station_{i}"))
+                d = bool(self._read(f"{base}.Work_Done_Station_{i}"))
+            except Exception:
+                w, d = False, False
+            working.append(w)
+            done.append(d)
+
+        return {
+            "working":  working,
+            "done":     done,
+            "any_free": not all(working),
+            "all_busy": all(working),
+        }
 
     def read_errors(self):
         n = self.read_num_errors()
