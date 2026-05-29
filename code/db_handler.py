@@ -516,6 +516,184 @@ def get_pending_orders():
         db_disconnect(connection)
 
 
+def get_orders_by_client(client_id: int | None = None, name: str | None = None, nif: int | None = None):
+    """Return all client_orders for a client, including their order lines.
+
+    Provide either client_id or name+NIF to identify the client.
+    Returns a list of dicts with keys: client_order_id, external_order_id, created_at, orders (list).
+    """
+    cursor, connection = db_connect()
+    if cursor is None:
+        return []
+    try:
+        if client_id is None:
+            if name is None and nif is None:
+                return []
+            cursor.execute("SELECT client_id FROM mes.clients WHERE name=%s AND nif=%s", (name, nif))
+            row = cursor.fetchone()
+            if not row:
+                return []
+            client_id = row[0]
+
+        cursor.execute("SELECT client_order_id, external_order_id, created_at FROM mes.client_orders WHERE client_id=%s ORDER BY created_at DESC", (client_id,))
+        orders = []
+        for co_row in cursor.fetchall():
+            co_id, external_id, created_at = co_row
+            cursor.execute("SELECT order_id, type, quantity, \"DDate\", penalty, priority, status, created_at FROM mes.orders WHERE client_order_id=%s ORDER BY order_id", (co_id,))
+            cols = [d[0] for d in cursor.description]
+            lines = [dict(zip(cols, r)) for r in cursor.fetchall()]
+            orders.append({
+                'client_order_id': co_id,
+                'external_order_id': external_id,
+                'created_at': created_at,
+                'orders': lines
+            })
+        return orders
+    except Exception as e:
+        print(f"Error fetching orders by client: {e}")
+        return []
+    finally:
+        db_disconnect(connection)
+
+
+def get_client_order_details(external_order_id: int, client_id: int | None = None):
+    """Return full details for a client_order identified by external_order_id (and optional client_id).
+
+    Returns a dict with client info and the list of order lines, or None if not found.
+    """
+    cursor, connection = db_connect()
+    if cursor is None:
+        return None
+    try:
+        if client_id is None:
+            cursor.execute("SELECT co.client_order_id, c.client_id, c.name, c.nif, co.created_at FROM mes.client_orders co JOIN mes.clients c USING (client_id) WHERE co.external_order_id=%s", (external_order_id,))
+        else:
+            cursor.execute("SELECT co.client_order_id, c.client_id, c.name, c.nif, co.created_at FROM mes.client_orders co JOIN mes.clients c USING (client_id) WHERE co.external_order_id=%s AND c.client_id=%s", (external_order_id, client_id))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        client_order_id, client_id, name, nif, co_created = row
+        cursor.execute("SELECT order_id, type, quantity, \"DDate\", penalty, priority, status, created_at FROM mes.orders WHERE client_order_id=%s ORDER BY order_id", (client_order_id,))
+        cols = [d[0] for d in cursor.description]
+        lines = [dict(zip(cols, r)) for r in cursor.fetchall()]
+        return {
+            'client': {'client_id': client_id, 'name': name, 'nif': nif},
+            'client_order': {'client_order_id': client_order_id, 'external_order_id': external_order_id, 'created_at': co_created},
+            'orders': lines
+        }
+    except Exception as e:
+        print(f"Error fetching client order details: {e}")
+        return None
+    finally:
+        db_disconnect(connection)
+
+
+def get_orders_due_on(target_date):
+    """Return orders whose computed due date (client_order.created_at + DDate days) falls on target_date.
+
+    target_date can be a datetime.date or a string in 'YYYY-MM-DD' format.
+    Returns list of order dicts including client and client_order information.
+    """
+    cursor, connection = db_connect()
+    if cursor is None:
+        return []
+    try:
+        # Compare date component of (client_orders.created_at + orders.DDate * interval '1 day')
+        cursor.execute(
+            """
+            SELECT o.order_id, o.type, o.quantity, o."DDate", o.penalty, o.priority, o.status,
+                   co.client_order_id, co.external_order_id, co.created_at AS co_created,
+                   c.client_id, c.name, c.nif,
+                   (co.created_at + (o."DDate" || ' days')::interval) AS due_at
+            FROM mes.orders o
+            JOIN mes.client_orders co ON o.client_order_id = co.client_order_id
+            JOIN mes.clients c ON co.client_id = c.client_id
+            WHERE date_trunc('day', co.created_at + (o."DDate" || ' days')::interval) = date_trunc('day', %s::timestamp)
+            ORDER BY due_at, o.order_id;
+            """, (str(target_date),)
+        )
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+    except Exception as e:
+        print(f"Error fetching orders due on {target_date}: {e}")
+        return []
+    finally:
+        db_disconnect(connection)
+
+
+def get_active_client_orders(statuses=('PENDING', 'IN_PROGRESS')):
+    """Return active orders (PENDING or IN_PROGRESS) grouped by client_order.
+
+    Each entry in the returned list has the shape:
+        {
+            'client': {'client_id', 'name', 'nif'},
+            'client_order': {'client_order_id', 'external_order_id', 'created_at'},
+            'orders': [ { order fields... }, ... ]
+        }
+
+    Useful for ERP/MES UI to show which client orders are still active and their lines.
+    """
+    cursor, connection = db_connect()
+    if cursor is None:
+        return []
+    try:
+        cursor.execute(
+            """
+            SELECT o.order_id AS order_id,
+                   o.type AS type,
+                   o.quantity AS quantity,
+                   o."DDate" AS DDate,
+                   o.penalty AS penalty,
+                   o.priority AS priority,
+                   o.status AS status,
+                   o.created_at AS order_created_at,
+                   co.client_order_id AS client_order_id,
+                   co.external_order_id AS external_order_id,
+                   co.created_at AS client_order_created_at,
+                   c.client_id AS client_id,
+                   c.name AS client_name,
+                   c.nif AS client_nif
+            FROM mes.orders o
+            JOIN mes.client_orders co ON o.client_order_id = co.client_order_id
+            JOIN mes.clients c ON co.client_id = c.client_id
+            WHERE o.status = ANY(%s)
+            ORDER BY co.client_order_id, o.order_id;
+            """,
+            (list(statuses),)
+        )
+
+        groups = {}
+        for row in cursor.fetchall():
+            (order_id, type_, quantity, DDate, penalty, priority, status, order_created_at,
+             client_order_id, external_order_id, client_order_created_at,
+             client_id, client_name, client_nif) = row
+
+            if client_order_id not in groups:
+                groups[client_order_id] = {
+                    'client': {'client_id': client_id, 'name': client_name, 'nif': client_nif},
+                    'client_order': {'client_order_id': client_order_id, 'external_order_id': external_order_id, 'created_at': client_order_created_at},
+                    'orders': []
+                }
+
+            groups[client_order_id]['orders'].append({
+                'order_id': order_id,
+                'type': type_,
+                'quantity': quantity,
+                'DDate': DDate,
+                'penalty': penalty,
+                'priority': priority,
+                'status': status,
+                'created_at': order_created_at,
+            })
+
+        return list(groups.values())
+    except Exception as e:
+        print(f"Error fetching active client orders: {e}")
+        return []
+    finally:
+        db_disconnect(connection)
+
+
 def update_order_status(order_id: int, status: str):
     """Set the status of an order.
 
