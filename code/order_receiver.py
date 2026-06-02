@@ -13,7 +13,7 @@ init(autoreset=True)
 # Run directly via CLI with --host, --port, --accept-timeout flags; or import OrderReceiver and use it programmatically with a callback.
 
 class OrderReceiver:
-    def __init__(self, host='localhost', port=6666, accept_timeout=10, client_timeout=5, on_order_received=None):
+    def __init__(self, host='0.0.0.0', port=6666, accept_timeout=10, client_timeout=5, on_order_received=None):
         self.host = host
         self.port = port
         self.accept_timeout = accept_timeout
@@ -55,6 +55,8 @@ class OrderReceiver:
             except KeyboardInterrupt:
                 print(Fore.YELLOW + "\nShutting down gracefully...")
                 break
+            except OSError:
+                break  # socket closed by stop_server()
 
             print(Fore.CYAN + f"Connection from {addr}")
             client_sock.settimeout(self.client_timeout)

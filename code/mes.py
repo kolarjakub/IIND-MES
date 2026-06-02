@@ -1,512 +1,468 @@
-from plc_interface import PLCInterface
-import db_handler as dbh
-import order_receiver as orc
+"""
+mes.py
+======
+In-memory MES. No database -- persistence is handled externally.
+
+Architecture
+------------
+  OrderReceiver (order_receiver.py)  --  TCP server, port 6666
+      |  callback: on_client_order(ClientOrder)
+      v
+  MES._orders  :  list[ActiveOrder], sorted by priority after every change
+      |  scheduler loop: pick highest-priority, dispatch to PLC, wait
+      v
+  PLCInterface  --  OPC-UA to CODESYS
+
+Priority formula  (from orders.py ActiveOrder.calculate_priority)
+-----------------
+  score = (penalty / estimated_time_remaining) * boost
+  estimated_time_remaining = qty_remaining * ESTIMATED_TIME[piece_type]
+  boost = IN_PROGRESS_BOOST when status == "IN_PROGRESS", else 1.0
+
+  Higher score = produced next.
+
+Warehouse / day cycle
+---------------------
+  At most WAREHOUSE_CAP pieces are dispatched per day cycle.
+  Every UNLOAD_INTERVAL seconds the day counter resets ("end of day").
+  Pieces are routed to the unloading dock (U) as they are produced --
+  no explicit W2 move is needed.
+
+Remote orders
+-------------
+  Any machine on the network can send orders to port 6666 using the
+  same JSON format as order_generator.py.
+"""
+
+import logging
 import threading
-import orders as ord
 import time
-from colorama import init, Fore, Style
+from typing import Optional
 
-init(autoreset=True)
+from orders import (
+    ActiveOrder, ClientOrder, Order as ProdOrder,
+    VALID_TYPES, ESTIMATED_TIME,
+)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
 
-SCHEDULING_INTERVAL = 5.0   # seconds between scheduler ticks
-STATUS_INTERVAL     = 2.0   # seconds between PLC status polls
-WAREHOUSE_CAPACITY  = 32    # max pieces per warehouse (from spec)
+# ── Tuning ────────────────────────────────────────────────────────────────────
 
-# Which cell each product type uses (confirmed from Final_Test PLC code)
-# RWM/SWM removed — not implemented in PLC yet (require multi-cell machining)
-CELL_MAP = {
-    "RWW": "C1",
-    "SWW": "C2",
-    "RMM": "C3",
-    "SMM": "C4",
-}
+IN_PROGRESS_BOOST = 1.5    # priority multiplier for in-progress orders
+WAREHOUSE_CAP     = 20     # max pieces dispatched per day cycle
+UNLOAD_INTERVAL   = 60.0   # simulated day length (real seconds)
+SCHEDULER_POLL    = 1.5    # main loop sleep (seconds)
+PRODUCTION_POLL   = 1.0    # how often to poll PLC procedures (seconds)
+PRODUCTION_TIMEOUT= 300.0  # hard timeout per batch (seconds)
+BATCH_SIZE        = 1      # pieces dispatched per PLC trigger (1 = sequential)
+                           # Each trigger writes BATCH_SIZE*13 slots at once so
+                           # the PLC tracks all procedures together.  Increase to
+                           # 4 for 4-cell parallelism; decrease to 1 if overloading.
+W1_THRESHOLD      = 20     # pause when W1 has this many pieces (cap = 32)
+ORDER_HOST        = "0.0.0.0"
+ORDER_PORT        = 6666
 
+
+# ── Display ID counter ────────────────────────────────────────────────────────
+
+_ao_id_counter = 0
+_ao_id_lock    = threading.Lock()
+
+def _next_ao_id() -> int:
+    global _ao_id_counter
+    with _ao_id_lock:
+        _ao_id_counter += 1
+        return _ao_id_counter
+
+
+# ── MES ───────────────────────────────────────────────────────────────────────
 
 class MES:
-    def __init__(self):
-        # PLC interface
-        self._plc = PLCInterface()
+    """
+    In-memory MES scheduler.
 
-        # Order receiver — single callback handles DB save + active list
-        self._order_receiver = orc.OrderReceiver(
-            on_order_received=[self._add_order_to_active_list]
-        )
+    Typical use (from main.py):
+        mes = MES(plc)
+        mes.start_receiver()   # start TCP order receiver daemon
+        mes.run()              # blocks until stop()
 
-        # Warehouse local tracking
-        self._warehouse_W1 = ord.WarehouseState(wood=0, metal=0)
-        self._warehouse_W2 = ord.WarehouseState(wood=0, metal=0)
+    Test use (from test_recipes.py):
+        mes = MES()            # plc=None is fine; only add_materials() is used
+    """
 
-        # Active orders list — PENDING and IN_PROGRESS
-        self._active_orders_list = list()
+    def __init__(self, plc=None,
+                 order_host: str = ORDER_HOST,
+                 order_port: int = ORDER_PORT):
+        self._plc        = plc
+        self._lock       = threading.Lock()
+        self._orders: list[ActiveOrder] = []
+        self._pieces_today: int = 0   # reset every UNLOAD_INTERVAL
+        self._stop       = threading.Event()
+        self._start_ts   = time.time()
+        self._order_host = order_host
+        self._order_port = order_port
+        self._receiver   = None
 
-        # Lock to protect shared state from race conditions
-        self._lock = threading.Lock()
+        # Stats
+        self._dispatched = 0
+        self._failed     = 0
+        self._day_cycles = 0
 
-        # Dock assignment — cycles 1->2->3->4->5->1
-        self._next_dock = 1
+        # Start unload timer
+        threading.Thread(target=self._unload_loop, daemon=True,
+                         name="unload-timer").start()
 
-    # ── Startup ───────────────────────────────────────────────────────────────
+    # ── Order ingestion ───────────────────────────────────────────────────────
 
-    def run(self):
-        """Start MES — connect to PLC, sync warehouse, start all threads."""
-        # Reload any unfinished orders from DB on startup
-        for row in dbh.get_pending_orders():
-            active = ord.ActiveOrder(
-                client_order_id = 0,
-                piece_type      = row['type'],
-                quantity        = row['quantity'],
-                ddate_days      = row['DDate'],
-                penalty         = row['penalty'],
-                status          = "PENDING",
-                db_order_id     = row['order_id'],
-            )
-            active.calculate_priority(in_progress_boost=1.5)
-            self._active_orders_list.append(active)
-
-        if self._active_orders_list:
-            print(f"{Fore.CYAN}[MES] Reloaded "
-                  f"{len(self._active_orders_list)} pending order(s) from DB"
-                  f"{Style.RESET_ALL}")
-
-        print(f"{Fore.GREEN}[MES] Starting...{Style.RESET_ALL}")
-
-        # Connect to PLC
-        if not self._plc.connect():
-            print(f"{Fore.RED}[MES] Could not connect to PLC. "
-                  f"Is CODESYS running?{Style.RESET_ALL}")
-
-        # Sync warehouse state on startup
-        self._sync_warehouse_state()
-
-        # Start threads
-        threading.Thread(
-            target=self._receive_orders, daemon=True, name="receiver"
-        ).start()
-        threading.Thread(
-            target=self._scheduler_loop, daemon=True, name="scheduler"
-        ).start()
-        threading.Thread(
-            target=self._status_loop, daemon=True, name="status"
-        ).start()
-
-        print(f"{Fore.GREEN}[MES] All threads started.{Style.RESET_ALL}")
-
-        # Keep main thread alive
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print(f"\n{Fore.YELLOW}[MES] Shutting down...{Style.RESET_ALL}")
-            self._plc.disconnect()
-
-    # ── Threads ───────────────────────────────────────────────────────────────
-
-    def _receive_orders(self):
-        """Thread: listen for incoming orders on TCP:6666."""
-        self._order_receiver.start_server()
-        self._order_receiver.receive_orders()
-
-    def _scheduler_loop(self):
-        """Thread: every SCHEDULING_INTERVAL seconds, dispatch highest priority order."""
-        while True:
-            time.sleep(SCHEDULING_INTERVAL)
-
-            # Reconcile warehouse with PLC before scheduling
-            self._reconcile_warehouse()
-
-            with self._lock:
-                pending = [o for o in self._active_orders_list
-                           if o.status == "PENDING"]
-
-                if not pending:
-                    continue
-
-                # Recalculate priorities and sort
-                for o in pending:
-                    o.calculate_priority(in_progress_boost=1.5)
-                pending.sort(key=lambda o: o.priority, reverse=True)
-
-                # Try to dispatch one order per available cell (parallel dispatch)
-                # e.g. RWW to C1 AND RMM to C3 in same tick
-                dispatched_cells = set()
-                dispatched_any   = False
-
-                for order in pending:
-                    cell = CELL_MAP.get(order.piece_type)
-
-                    # Skip if we already dispatched to this cell this tick
-                    if cell in dispatched_cells:
-                        continue
-
-                    # Check if cell has free workstations
-                    cell_avail = self._plc.get_cell_availability(cell)
-                    if not cell_avail["any_free"]:
-                        print(
-                            f"{Fore.YELLOW}[MES] Cell {cell} full "
-                            f"— skipping {order.piece_type}{Style.RESET_ALL}"
-                        )
-                        continue
-
-                    if self._can_dispatch(order):
-                        self._dispatch(order)
-                        dispatched_cells.add(cell)
-                        dispatched_any = True
-                    else:
-                        needed = ord.RAW_MATERIALS[order.piece_type]
-                        print(
-                            f"{Fore.YELLOW}[MES] Waiting for materials: "
-                            f"{order.quantity_remaining}x {order.piece_type} "
-                            f"needs Wood={needed.get('Wood', 0) * order.quantity_remaining} "
-                            f"Metal={needed.get('Metal', 0) * order.quantity_remaining} "
-                            f"| W1 has Wood={self._warehouse_W1.wood} "
-                            f"Metal={self._warehouse_W1.metal}"
-                            f"{Style.RESET_ALL}"
-                        )
-
-                if not dispatched_any and pending:
-                    print(f"{Fore.YELLOW}[MES] No orders dispatchable "
-                          f"— waiting for materials or free cells{Style.RESET_ALL}")
-
-    def _status_loop(self):
-        """Thread: every STATUS_INTERVAL seconds, poll PLC for completed procedures."""
-        while True:
-            time.sleep(STATUS_INTERVAL)
-            self._poll_plc_status()
-
-    # ── Order intake ──────────────────────────────────────────────────────────
-
-    def _add_order_to_active_list(self, client_order):
-        """Callback from OrderReceiver — saves to DB and creates ActiveOrders."""
-        order_ids = dbh.save_to_db(client_order)
-        if not order_ids:
-            order_ids = []
-
+    def on_client_order(self, client_order: ClientOrder):
+        """
+        Callback for OrderReceiver.
+        Converts each line in the ClientOrder to an ActiveOrder and
+        inserts it into the priority queue immediately.
+        """
+        now = time.time()
+        added = []
         with self._lock:
-            for i, order in enumerate(client_order.orders):
-                if order.type not in ord.VALID_TYPES:
-                    print(f"{Fore.RED}[MES] Unknown type {order.type}, "
-                          f"skipping{Style.RESET_ALL}")
-                    continue
-
-                db_id = order_ids[i] if i < len(order_ids) else None
-
-                active_order = ord.ActiveOrder(
+            for o in client_order.orders:
+                ao = ActiveOrder(
                     client_order_id = client_order.OrderID,
-                    piece_type      = order.type,
-                    quantity        = order.quantity,
-                    ddate_days      = order.DDate,
-                    penalty         = order.Penalty,
+                    piece_type      = o.type.upper(),
+                    quantity        = o.quantity,
+                    ddate_days      = o.DDate,
+                    penalty         = o.Penalty,
                     status          = "PENDING",
-                    db_order_id     = db_id,
+                    started_at      = now,
                 )
-                active_order.calculate_priority(in_progress_boost=1.5)
-                self._active_orders_list.append(active_order)
-                print(
-                    f"{Fore.GREEN}[MES] Queued {order.quantity}x {order.type} "
-                    f"| priority={active_order.priority:.3f} "
-                    f"| db_id={db_id}{Style.RESET_ALL}"
-                )
+                ao.db_order_id = _next_ao_id()
+                ao.calculate_priority(IN_PROGRESS_BOOST)
+                self._orders.append(ao)
+                added.append(ao)
+            self._sort_locked()
 
-    # ── Warehouse sync ────────────────────────────────────────────────────────
-
-    def _sync_warehouse_state(self):
-        """Read warehouse counts from PLC on startup — type-aware breakdown."""
-        try:
-            status     = self._plc.get_warehouse_status()
-            total_w1   = status["W1"]
-            total_w2   = status["W2"]
-            w1_wood    = status.get("W1_wood",     0)
-            w1_metal   = status.get("W1_metal",    0)
-            w2_finished= status.get("W2_finished", 0)
-
-            self._warehouse_W1 = ord.WarehouseState(wood=w1_wood,    metal=w1_metal)
-            self._warehouse_W2 = ord.WarehouseState(wood=w2_finished, metal=0)
-
-            print(
-                f"{Fore.GREEN}[MES] Warehouse synced: "
-                f"W1={total_w1} (Wood={w1_wood} Metal={w1_metal}) "
-                f"W2={total_w2} (Finished={w2_finished})"
-                f"{Style.RESET_ALL}"
-            )
-
-        except Exception as e:
-            print(f"{Fore.RED}[MES] Could not sync warehouse: {e}{Style.RESET_ALL}")
-
-    # ── ERP interface — called directly by ERP ────────────────────────────────
+        for ao in added:
+            _log(f"[queue] #{ao.db_order_id}  "
+                 f"{ao.quantity}×{ao.piece_type}  "
+                 f"DDate={ao.ddate_days}d  Penalty={ao.penalty}  "
+                 f"score={ao.priority:.3f}  ({client_order.name})")
+        self._print_queue()
 
     def add_materials(self, wood: int = 0, metal: int = 0):
         """
-        Called by ERP to notify MES that raw materials have been loaded into W1.
-
-        The ERP calls this after purchasing from a supplier and the materials
-        arrive at the loading cell L. MES updates its W1 tracking accordingly
-        so the scheduler can dispatch pending orders.
-
-        Args:
-            wood:  number of Wood pieces added to W1
-            metal: number of Metal pieces added to W1
+        Stub for test_recipes.py compatibility.
+        Raw material loading is handled externally (SFS loading docks).
         """
-        if wood < 0 or metal < 0:
-            print(f"{Fore.RED}[MES] add_materials: negative values not allowed"
-                  f"{Style.RESET_ALL}")
+        _log(f"[materials] add_materials called: wood={wood} metal={metal}  "
+             f"-- please load manually via SFS loading docks")
+
+    # ── Receiver startup ──────────────────────────────────────────────────────
+
+    def start_receiver(self):
+        """Start the TCP order receiver in a daemon thread."""
+        from order_receiver import OrderReceiver
+        self._receiver = OrderReceiver(
+            host              = self._order_host,
+            port              = self._order_port,
+            on_order_received = self.on_client_order,
+        )
+        self._receiver.start_server()
+        threading.Thread(
+            target = self._receiver.receive_orders,
+            daemon = True,
+            name   = "order-receiver",
+        ).start()
+
+    # ── Main scheduler loop ───────────────────────────────────────────────────
+
+    def run(self):
+        """
+        Scheduler loop -- blocks until stop() is called.
+
+        Each tick:
+          1. Recalculate + re-sort priorities.
+          2. Check day cap and W1 warehouse level.
+          3. Build a batch of up to BATCH_SIZE highest-priority pieces.
+          4. Write all batch slots in ONE trigger (BATCH_SIZE*13 slots).
+          5. Poll until ALL batch procedures clear.
+          6. Credit every piece in the batch.
+
+        Writing multiple recipes in one trigger keeps MES_Procedures[0..N*13-1]
+        filled for the entire batch -- no overwrite between pieces.
+        """
+        _banner("MES scheduler running -- Ctrl+C or 'exit' to stop")
+
+        while not self._stop.is_set():
+            if self._plc is None:
+                time.sleep(SCHEDULER_POLL)
+                continue
+
+            with self._lock:
+                self._recalculate_locked()
+                self._sort_locked()
+                capped = (self._pieces_today >= WAREHOUSE_CAP)
+                batch_orders = self._pick_batch_locked()
+
+            if not batch_orders:
+                time.sleep(SCHEDULER_POLL)
+                continue
+
+            if capped:
+                _log(f"[scheduler] Day cap "
+                     f"({self._pieces_today}/{WAREHOUSE_CAP}) "
+                     f"-- waiting for unload")
+                time.sleep(SCHEDULER_POLL)
+                continue
+
+            # Check W1 has room for BATCH_SIZE * 3 more raw pieces
+            try:
+                w1 = self._plc.get_warehouse_status()["W1"]
+                if w1 >= W1_THRESHOLD:
+                    _log(f"[scheduler] W1 near capacity "
+                         f"({w1}/{W1_THRESHOLD}) -- waiting")
+                    time.sleep(SCHEDULER_POLL)
+                    continue
+            except Exception as exc:
+                _log(f"[scheduler] W1 read error: {exc}")
+
+            # Build + dispatch batch
+            self._print_queue()
+            types_str = " + ".join(o.piece_type for o in batch_orders)
+            _log(f"[scheduler] Dispatching batch of {len(batch_orders)}: "
+                 f"{types_str}")
+
+            success = self._dispatch_batch_and_wait(batch_orders)
+
+            with self._lock:
+                for order in batch_orders:
+                    if success:
+                        order.quantity_done += 1
+                        self._pieces_today += 1
+                        self._dispatched += 1
+                        if order.quantity_done >= order.quantity:
+                            order.status = "COMPLETED"
+                            _log(f"[scheduler] ✓ Order #{order.db_order_id} "
+                                 f"COMPLETE ({order.quantity}×{order.piece_type})")
+                        else:
+                            order.status = "IN_PROGRESS"
+                            _log(f"[scheduler] ✓ #{order.db_order_id} "
+                                 f"{order.quantity_done}/{order.quantity}  "
+                                 f"today={self._pieces_today}/{WAREHOUSE_CAP}")
+                    else:
+                        self._failed += 1
+                        order.status = "PENDING"
+                self._recalculate_locked()
+                self._sort_locked()
+
+            time.sleep(SCHEDULER_POLL)
+
+    def stop(self):
+        self._stop.set()
+        if self._receiver is not None:
+            try:
+                self._receiver.stop_server()
+            except Exception:
+                pass
+
+    # ── Unload loop ───────────────────────────────────────────────────────────
+
+    def _unload_loop(self):
+        time.sleep(UNLOAD_INTERVAL)
+        while not self._stop.is_set():
+            self._do_unload()
+            time.sleep(UNLOAD_INTERVAL)
+
+    def _do_unload(self):
+        with self._lock:
+            count = self._pieces_today
+        self._day_cycles += 1
+        _log(f"[unload] Day #{self._day_cycles} end -- "
+             f"{count} piece(s) on unload docks -- resetting counter")
+        with self._lock:
+            self._pieces_today = 0
+
+    # ── Production ────────────────────────────────────────────────────────────
+
+    def _dispatch_batch_and_wait(self, orders: list) -> bool:
+        """
+        Build one recipe per order, concatenate all slots into a single
+        write+trigger.  The PLC fills MES_Procedures[0..N*13-1] for the
+        entire batch, so all pieces are tracked in one poll cycle.
+
+        Returns True when all batch procedures clear (all pieces done).
+        """
+        from opcua_handler import build_recipe
+        all_slots = []
+        for order in orders:
+            id_rec, id_proc, id_piece, id_final = self._plc._alloc_ids()
+            slots = build_recipe(
+                piece_type         = order.piece_type,
+                id_recipe          = id_rec,
+                id_procedure_start = id_proc,
+                id_piece_start     = id_piece,
+                id_final_piece     = id_final,
+            )
+            all_slots.extend(slots)
+
+        n_slots = len(all_slots)
+        try:
+            self._plc._handler.write_procedure_limits(n_slots)
+            if not self._plc._handler.write_recipe(all_slots):
+                _log("[dispatch] Recipe write failed")
+                return False
+            if not self._plc._handler.trigger_recipe():
+                _log("[dispatch] PLC did not acknowledge trigger")
+                return False
+        except Exception as exc:
+            _log(f"[dispatch] Exception: {exc}")
+            return False
+
+        _log(f"[dispatch] PLC ack -- {n_slots} slots "
+             f"({len(orders)} piece(s)) -- polling...")
+        return self._wait_for_completion(
+            timeout   = PRODUCTION_TIMEOUT,
+            max_slots = n_slots + 5,   # enough to see all batch procedures
+        )
+
+    def _wait_for_completion(self, timeout: float,
+                             max_slots: int = 15) -> bool:
+        """
+        Poll read_procedures(max_slots) every second until all clear.
+        Same logic as test_recipes.poll_result -- returns True when done.
+        """
+        time.sleep(2.0)   # give PLC a moment to start
+        start      = time.time()
+        prev_count = -1
+        saw_active = False
+
+        while (time.time() - start) < timeout:
+            if self._stop.is_set():
+                return False
+            try:
+                procs   = self._plc._handler.read_procedures(
+                              max_slots=max_slots)
+                errors  = self._plc.get_errors()
+                n       = len(procs)
+                elapsed = int(time.time() - start)
+
+                for e in errors:
+                    _log(f"[production] PLC error "
+                         f"code={e['code']} proc={e['procedure_id']}")
+
+                if n != prev_count:
+                    _log(f"[production]   [{elapsed:3d}s] procs={n}")
+                    prev_count = n
+
+                if n > 0:
+                    saw_active = True
+                if n == 0 and elapsed > 2:
+                    return True
+
+            except Exception as exc:
+                _log(f"[production] Poll error: {exc}")
+
+            time.sleep(PRODUCTION_POLL)
+
+        _log(f"[production] Timeout after {timeout:.0f}s "
+             f"(saw_active={saw_active})")
+        return saw_active
+
+    # ── Priority helpers ──────────────────────────────────────────────────────
+
+    def _recalculate_locked(self):
+        for o in self._orders:
+            o.calculate_priority(IN_PROGRESS_BOOST)
+
+    def _sort_locked(self):
+        """Highest priority first; completed orders sink to the bottom."""
+        self._orders.sort(key=lambda o: (
+            0 if o.quantity_remaining > 0 else 1,  # active before done
+            -o.priority,
+        ))
+
+    def _pick_batch_locked(self) -> list:
+        """
+        Return up to BATCH_SIZE highest-priority orders that still have
+        pieces to produce.  Tries to pick from different orders first;
+        fills remaining slots from the top order if needed.
+        """
+        seen: dict[int, int] = {}   # id(order) -> pieces already picked
+        batch = []
+
+        for o in self._orders:
+            if len(batch) >= BATCH_SIZE:
+                break
+            already = seen.get(id(o), 0)
+            if o.quantity_done + already < o.quantity:
+                batch.append(o)
+                seen[id(o)] = already + 1
+
+        return batch
+
+    # ── Display ───────────────────────────────────────────────────────────────
+
+    def _print_queue(self):
+        with self._lock:
+            active = [o for o in self._orders if o.quantity_remaining > 0]
+            done   = [o for o in self._orders if o.quantity_remaining == 0]
+
+        if not active and not done:
             return
 
+        ts = time.strftime("%H:%M:%S")
+        print(f"\n  [{ts}]  today={self._pieces_today}/{WAREHOUSE_CAP}  "
+              f"active={len(active)}  done={len(done)}")
+        print(f"  {'#':>4}  {'Type':4}  {'Done/Qty':>8}  "
+              f"{'Score':>9}  {'Penalty':>8}  {'DDate':>5}  Status")
+        print(f"  {'─'*4}  {'─'*4}  {'─'*8}  {'─'*9}  "
+              f"{'─'*8}  {'─'*5}  {'─'*11}")
+        for i, o in enumerate(active[:12]):
+            marker = "►" if i == 0 else " "
+            print(f"  {marker}{o.db_order_id or 0:3d}  "
+                  f"{o.piece_type:4}  "
+                  f"{o.quantity_done:3d}/{o.quantity:<3d}  "
+                  f"{o.priority:9.3f}  "
+                  f"{o.penalty:8}  "
+                  f"{o.ddate_days:5d}  "
+                  f"{o.status}")
+        if done:
+            print(f"  ── {len(done)} completed ──")
+
+    def print_stats(self):
         with self._lock:
-            self._warehouse_W1.wood  += wood
-            self._warehouse_W1.metal += metal
+            orders = list(self._orders)
 
-        print(
-            f"{Fore.GREEN}[MES] Materials added: +{wood} Wood +{metal} Metal "
-            f"| W1 now: Wood={self._warehouse_W1.wood} "
-            f"Metal={self._warehouse_W1.metal}{Style.RESET_ALL}"
-        )
+        uptime  = int(time.time() - self._start_ts)
+        n_done  = sum(1 for o in orders if o.quantity_remaining == 0)
+        n_pend  = sum(1 for o in orders if o.quantity_remaining > 0)
+        p_done  = sum(o.quantity_done for o in orders)
+        p_total = sum(o.quantity      for o in orders)
 
-    def get_status(self) -> dict:
-        """
-        Called by ERP to get a snapshot of MES state.
-
-        Returns dict with:
-            warehouse_W1: {"wood": int, "metal": int}
-            warehouse_W2: {"wood": int, "metal": int}
-            pending:      number of pending orders
-            in_progress:  number of in-progress orders
-            completed:    number of completed orders
-            plc_ready:    bool
-        """
-        with self._lock:
-            pending     = sum(1 for o in self._active_orders_list if o.status == "PENDING")
-            in_progress = sum(1 for o in self._active_orders_list if o.status == "IN_PROGRESS")
-            completed   = sum(1 for o in self._active_orders_list if o.status == "COMPLETED")
-
-            pending_orders = [
-                {"piece_type": o.piece_type, "quantity": o.quantity_remaining,
-                 "client_order_id": o.client_order_id, "status": "PENDING"}
-                for o in self._active_orders_list if o.status == "PENDING"
-            ]
-            in_progress_orders = [
-                {"piece_type": o.piece_type, "quantity": o.quantity_remaining,
-                 "client_order_id": o.client_order_id, "status": "IN_PROGRESS",
-                 "dock": getattr(o, "dock", "?")}
-                for o in self._active_orders_list if o.status == "IN_PROGRESS"
-            ]
-
-        return {
-            "warehouse_W1":       {"wood": self._warehouse_W1.wood,
-                                   "metal": self._warehouse_W1.metal},
-            "warehouse_W2":       {"wood": self._warehouse_W2.wood,
-                                   "metal": self._warehouse_W2.metal},
-            "pending":            pending,
-            "in_progress":        in_progress,
-            "completed":          completed,
-            "plc_ready":          self._plc.is_ready(),
-            "pending_orders":     pending_orders,
-            "in_progress_orders": in_progress_orders,
-        }
-
-    # ── Scheduling helpers ────────────────────────────────────────────────────
-
-    def _reconcile_warehouse(self):
-        """
-        Sync MES warehouse tracking with PLC data.
-
-        Strategy:
-        - If PLC has MORE than MES thinks → trust PLC (piece arrived we missed)
-        - If PLC has LESS than MES thinks → keep MES value
-          (ERP simulated delivery — piece not physically in SFS yet but
-           is allocated for production. Reducing would block scheduling.)
-        - If PLC has ZERO and MES > 0 → only reset if we have no pending
-          orders waiting for material (safety check for complete drift)
-        """
-        try:
-            inv       = self._plc.get_warehouse_status()
-            plc_wood  = inv.get("W1_wood",  0)
-            plc_metal = inv.get("W1_metal", 0)
-
-            with self._lock:
-                mes_wood  = self._warehouse_W1.wood
-                mes_metal = self._warehouse_W1.metal
-
-                if plc_wood == mes_wood and plc_metal == mes_metal:
-                    return  # in sync
-
-                # Only correct upward — never reduce simulated ERP stock
-                new_wood  = max(mes_wood,  plc_wood)
-                new_metal = max(mes_metal, plc_metal)
-
-                if new_wood != mes_wood or new_metal != mes_metal:
-                    print(
-                        f"{Fore.YELLOW}[MES] W1 corrected up: "
-                        f"Wood:{mes_wood}→{new_wood} "
-                        f"Metal:{mes_metal}→{new_metal}{Style.RESET_ALL}"
-                    )
-                    self._warehouse_W1 = ord.WarehouseState(
-                        wood=new_wood, metal=new_metal
-                    )
-
-        except Exception as e:
-            print(f"{Fore.RED}[MES] Warehouse reconcile failed: {e}{Style.RESET_ALL}")
-
-    def _can_dispatch(self, order: ord.ActiveOrder) -> bool:
-        """Check if warehouse has enough material and W2 has space."""
-        needed   = ord.RAW_MATERIALS[order.piece_type]
-        wood_ok  = self._warehouse_W1.wood  >= needed.get("Wood",  0) * order.quantity_remaining
-        metal_ok = self._warehouse_W1.metal >= needed.get("Metal", 0) * order.quantity_remaining
-        w2_space = (self._warehouse_W2.total + order.quantity_remaining) <= WAREHOUSE_CAPACITY
-        return wood_ok and metal_ok and w2_space
-
-    def _get_next_dock(self) -> int:
-        """Assign next available unloading dock, cycling 1-5."""
-        dock = self._next_dock
-        self._next_dock = (self._next_dock % 5) + 1
-        return dock
-
-    def _dispatch(self, order: ord.ActiveOrder):
-        """Send order to PLC with dock assignment and update order status."""
-        qty  = order.quantity_remaining
-        dock = self._get_next_dock()
-
-        print(f"{Fore.CYAN}[MES] Dispatching {qty}x {order.piece_type} "
-              f"-> dock {dock}...{Style.RESET_ALL}")
-
-        # Use unload_order for large quantities (auto-splits across docks)
-        # Use create_pieces_for_unload for <= 6 pieces (single dock)
-        if qty <= 6:
-            success = self._plc.create_pieces_for_unload(
-                order.piece_type, qty, dock=dock
-            )
-        else:
-            success = self._plc.unload_order(order.piece_type, qty)
-
-        if success:
-            order.status     = "IN_PROGRESS"
-            order.started_at = time.time()
-            order.dock       = dock
-            order.calculate_priority(in_progress_boost=1.5)
-
-            if order.db_order_id is not None:
-                dbh.update_order_status(order.db_order_id, "IN_PROGRESS")
-
-            # Deduct materials from W1 tracking
-            needed = ord.RAW_MATERIALS[order.piece_type]
-            self._warehouse_W1.wood  -= needed.get("Wood",  0) * qty
-            self._warehouse_W1.metal -= needed.get("Metal", 0) * qty
-
-            print(
-                f"{Fore.GREEN}[MES] Dispatched {qty}x {order.piece_type} "
-                f"-> dock {dock} | "
-                f"W1 remaining: Wood={self._warehouse_W1.wood} "
-                f"Metal={self._warehouse_W1.metal}{Style.RESET_ALL}"
-            )
-        else:
-            print(f"{Fore.RED}[MES] PLC rejected {order.piece_type} "
-                  f"— will retry next tick{Style.RESET_ALL}")
-
-    # ── Status polling ────────────────────────────────────────────────────────
-
-    def _poll_plc_status(self):
-        """
-        Poll PLC for completed procedures and update order statuses.
-
-        Sequence:
-          1. Procedures go to 0 — PLC finished processing
-          2. Piece travels conveyor to W2 — takes a few more seconds
-          3. W2 count increases — piece physically arrived
-          4. Mark order complete
-
-        We wait for W2 increase rather than procedures=0 to avoid
-        marking complete before the piece actually arrives.
-        """
-        try:
-            procedures = self._plc.get_procedures()
-            inv        = self._plc.get_warehouse_status()
-            w2_now     = inv.get("W2", 0)
-
-            with self._lock:
-                in_progress = [o for o in self._active_orders_list
-                               if o.status == "IN_PROGRESS"]
-
-                if not in_progress:
-                    return
-
-                if procedures:
-                    print(f"[MES] Waiting for PLC — "
-                          f"{len(procedures)} procedure(s) still active")
-                    return
-
-                # Procedures cleared — now wait for W2 to increase
-                # Get total expected pieces from in_progress orders
-                expected_pieces = sum(o.quantity for o in in_progress)
-                w2_baseline = getattr(self, "_w2_baseline", 0)
-
-                if not hasattr(self, "_procedures_cleared_at"):
-                    # First tick with procedures=0 — record W2 baseline
-                    self._procedures_cleared_at = True
-                    self._w2_baseline = w2_now
-                    print(
-                        f"{Fore.YELLOW}[MES] Procedures cleared — "
-                        f"waiting for piece(s) to arrive in W2 "
-                        f"(W2 now={w2_now}){Style.RESET_ALL}"
-                    )
-                    return
-
-                # Check if W2 increased enough
-                new_pieces = w2_now - self._w2_baseline
-                if new_pieces >= expected_pieces:
-                    print(
-                        f"{Fore.GREEN}[MES] Piece(s) arrived in W2 "
-                        f"(+{new_pieces}) — marking {len(in_progress)} "
-                        f"order(s) complete{Style.RESET_ALL}"
-                    )
-                    # Reset tracking
-                    del self._procedures_cleared_at
-                    self._w2_baseline = 0
-                    for order in in_progress:
-                        self._complete_order(order)
-                else:
-                    print(
-                        f"{Fore.YELLOW}[MES] Procedures done, waiting for W2 "
-                        f"(got {new_pieces}/{expected_pieces} pieces){Style.RESET_ALL}"
-                    )
-
-        except Exception as e:
-            print(f"{Fore.RED}[MES] Status poll failed: {e}{Style.RESET_ALL}")
-
-    def _complete_order(self, order: ord.ActiveOrder):
-        """Mark order as completed, update warehouse tracking, update DB."""
-        order.status        = "COMPLETED"
-        order.quantity_done = order.quantity
-        dock = getattr(order, "dock", "?")
-
-        print(
-            f"{Fore.GREEN}"
-            f"╔══════════════════════════════════════╗\n"
-            f"║  ORDER COMPLETED                     ║\n"
-            f"║  Type    : {order.piece_type:<26}║\n"
-            f"║  Quantity: {order.quantity:<26}║\n"
-            f"║  Dock    : {str(dock):<26}║\n"
-            f"╚══════════════════════════════════════╝"
-            f"{Style.RESET_ALL}"
-        )
-
-        if order.db_order_id is not None:
-            dbh.update_order_status(order.db_order_id, "COMPLETED")
-
-        # Notify ERP so penalty accrual stops
-        if hasattr(self, "_erp") and self._erp is not None:
-            self._erp.mark_order_delivered(order.client_order_id, order.piece_type)
-
-        # Update W2 tracking
-        self._warehouse_W2.wood = max(0, self._warehouse_W2.wood - order.quantity)
-
-    def set_erp(self, erp):
-        """Set reference to ERP instance for order completion callbacks."""
-        self._erp = erp
+        print(f"\n{'='*55}")
+        print(f"  MES Statistics")
+        print(f"{'='*55}")
+        print(f"  Uptime       : "
+              f"{uptime//3600}h {uptime%3600//60}m {uptime%60}s")
+        print(f"  Orders       : {len(orders)}  "
+              f"({n_done} done, {n_pend} pending)")
+        print(f"  Pieces       : {p_done}/{p_total}")
+        print(f"  PLC dispatch : {self._dispatched}  "
+              f"failed={self._failed}")
+        print(f"  Unload cycles: {self._day_cycles}")
+        print(f"  Today        : {self._pieces_today}/{WAREHOUSE_CAP}")
+        if orders:
+            print()
+            self._print_queue()
+        print()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    mes = MES()
-    mes.run()
+def _log(msg: str):
+    ts = time.strftime("%H:%M:%S")
+    print(f"  {ts}  {msg}")
+    logger.info(msg)
+
+
+def _banner(msg: str):
+    print(f"\n  {'─'*60}")
+    print(f"  {msg}")
+    print(f"  {'─'*60}")
