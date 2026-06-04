@@ -43,6 +43,12 @@ from orders import (
     ActiveOrder, ClientOrder, Order as ProdOrder,
     VALID_TYPES, ESTIMATED_TIME,
 )
+try:
+    from db_handler import update_order_status
+except Exception:
+    # db_handler may not be available in some test contexts
+    def update_order_status(order_id, status):
+        return
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +120,7 @@ class MES:
 
     # ── Order ingestion ───────────────────────────────────────────────────────
 
-    def on_client_order(self, client_order: ClientOrder):
+    def on_client_order(self, client_order: ClientOrder, db_order_ids: list | None = None):
         """
         Callback for OrderReceiver.
         Converts each line in the ClientOrder to an ActiveOrder and
@@ -123,7 +129,7 @@ class MES:
         now = time.time()
         added = []
         with self._lock:
-            for o in client_order.orders:
+            for idx, o in enumerate(client_order.orders):
                 ao = ActiveOrder(
                     client_order_id = client_order.OrderID,
                     piece_type      = o.type.upper(),
@@ -133,7 +139,11 @@ class MES:
                     status          = "PENDING",
                     started_at      = now,
                 )
-                ao.db_order_id = _next_ao_id()
+                # prefer DB provided id (when restoring or after saving) otherwise generate internal id
+                if db_order_ids and idx < len(db_order_ids) and db_order_ids[idx]:
+                    ao.db_order_id = db_order_ids[idx]
+                else:
+                    ao.db_order_id = _next_ao_id()
                 ao.calculate_priority(IN_PROGRESS_BOOST)
                 self._orders.append(ao)
                 added.append(ao)
@@ -241,14 +251,26 @@ class MES:
                             order.status = "COMPLETED"
                             _log(f"[scheduler] ✓ Order #{order.db_order_id} "
                                  f"COMPLETE ({order.quantity}×{order.piece_type})")
+                            try:
+                                update_order_status(order.db_order_id, order.status)
+                            except Exception:
+                                pass
                         else:
                             order.status = "IN_PROGRESS"
                             _log(f"[scheduler] ✓ #{order.db_order_id} "
                                  f"{order.quantity_done}/{order.quantity}  "
                                  f"today={self._pieces_today}/{WAREHOUSE_CAP}")
+                            try:
+                                update_order_status(order.db_order_id, order.status)
+                            except Exception:
+                                pass
                     else:
                         self._failed += 1
                         order.status = "PENDING"
+                        try:
+                            update_order_status(order.db_order_id, order.status)
+                        except Exception:
+                            pass
                 self._recalculate_locked()
                 self._sort_locked()
 

@@ -603,6 +603,77 @@ def get_unload_summary():
         db_disconnect(connection)
 
 
+def get_active_client_orders(statuses=('PENDING', 'IN_PROGRESS')):
+    """Return active orders (PENDING or IN_PROGRESS) grouped by client_order.
+
+    Each entry in the returned list has the shape:
+        {
+            'client': {'client_id', 'name', 'nif'},
+            'client_order': {'client_order_id', 'external_order_id', 'created_at'},
+            'orders': [ { order fields... }, ... ]
+        }
+    """
+    cursor, connection = db_connect()
+    if cursor is None:
+        return []
+    try:
+        cursor.execute(
+            """
+            SELECT o.order_id AS order_id,
+                   o.type AS type,
+                   o.quantity AS quantity,
+                   o."DDate" AS DDate,
+                   o.penalty AS penalty,
+                   o.priority AS priority,
+                   o.status AS status,
+                   o.created_at AS order_created_at,
+                   co.client_order_id AS client_order_id,
+                   co.external_order_id AS external_order_id,
+                   co.created_at AS client_order_created_at,
+                   c.client_id AS client_id,
+                   c.name AS client_name,
+                   c.nif AS client_nif
+            FROM mes.orders o
+            JOIN mes.client_orders co ON o.client_order_id = co.client_order_id
+            JOIN mes.clients c ON co.client_id = c.client_id
+            WHERE o.status = ANY(%s)
+            ORDER BY co.client_order_id, o.order_id;
+            """,
+            (list(statuses),)
+        )
+
+        groups = {}
+        for row in cursor.fetchall():
+            (order_id, type_, quantity, DDate, penalty, priority, status, order_created_at,
+             client_order_id, external_order_id, client_order_created_at,
+             client_id, client_name, client_nif) = row
+
+            if client_order_id not in groups:
+                groups[client_order_id] = {
+                    'client': {'client_id': client_id, 'name': client_name, 'nif': client_nif},
+                    'client_order': {'client_order_id': client_order_id, 'external_order_id': external_order_id, 'created_at': client_order_created_at},
+                    'orders': []
+                }
+
+            groups[client_order_id]['orders'].append({
+                'order_id': order_id,
+                'type': type_,
+                'quantity': quantity,
+                'DDate': DDate,
+                'penalty': penalty,
+                'priority': priority,
+                'status': status,
+                'created_at': order_created_at,
+            })
+
+        return list(groups.values())
+    except Exception as e:
+        print(f"Error fetching active client orders: {e}")
+        return []
+    finally:
+        db_disconnect(connection)
+
+
 # ---------------------------------------------------------------------------
 # Truncate (dev / testing only)
 # ---------------------------------------------------------------------------
@@ -649,12 +720,36 @@ _MACHINE_TOOLS = {
 }
 
 if __name__ == "__main__":
-    db_init()
-    for machine_name, (cell, tools) in _MACHINE_TOOLS.items():
-        register_machine(machine_name, cell, tools)
-    print("All machines registered.")
-
+    import argparse
     from order_receiver import OrderReceiver
+
+    parser = argparse.ArgumentParser(description="DB handler / ERP starter")
+    parser.add_argument('--init', action='store_true', help='Drop and recreate mes schema')
+    parser.add_argument('--no-register', action='store_true', help='Do not (re)register machines')
+    parser.add_argument('--snapshot-interval', type=int, default=0, help='Seconds between automatic machine snapshots (0 = disabled)')
+    args = parser.parse_args()
+
+    if args.init:
+        print("Initializing DB schema (this will drop existing data)...")
+        db_init()
+    else:
+        print("Skipping DB init (use --init to recreate schema)")
+
+    if not args.no_register:
+        for machine_name, (cell, tools) in _MACHINE_TOOLS.items():
+            register_machine(machine_name, cell, tools)
+        print("All machines registered (upserted).")
+    else:
+        print("Skipping machine registration (--no-register set)")
+
+    # Load pending/in-progress orders so the ERP/MES can resume after a restart
+    pending = get_active_client_orders()
+    print(f"Loaded {len(pending)} active client orders from DB (status PENDING/IN_PROGRESS)")
+
     receiver = OrderReceiver(on_order_received=save_to_db)
-    receiver.start_server()
-    receiver.receive_orders()
+    try:
+        receiver.start_server()
+        receiver.receive_orders()
+    except KeyboardInterrupt:
+        print("Shutting down receiver...")
+        receiver.stop_server()

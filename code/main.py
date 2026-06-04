@@ -209,6 +209,8 @@ Examples
                     help=f"Day length in seconds (default {UNLOAD_INTERVAL})")
     ap.add_argument("--verbose", action="store_true",
                     help="Enable debug logging")
+    ap.add_argument("--init", action="store_true", help="Drop and recreate DB schema before starting")
+    ap.add_argument("--no-register", action="store_true", help="Do not register machines in DB on startup")
     args = ap.parse_args()
 
     import mes as _mes_module
@@ -250,9 +252,73 @@ Examples
     except Exception as e:
         print(f"\n  {YELLOW}Warning: could not read PLC status: {e}{RESET}")
 
-    # Create MES, start receiver + scheduler
+    # Create MES
     mes = MES(plc, order_host=args.bind, order_port=args.port)
-    mes.start_receiver()
+
+    # Try to import DB helpers (optional)
+    try:
+        from db_handler import db_init, register_machine, get_active_client_orders, save_to_db
+    except Exception:
+        db_init = register_machine = get_active_client_orders = save_to_db = None
+
+    # Optionally initialize DB schema
+    if args.init and db_init is not None:
+        print("Initializing DB schema (this will drop existing data)...")
+        db_init()
+
+    # Register machines in DB (idempotent)
+    if not args.no_register and register_machine is not None:
+        try:
+            from db_handler import _MACHINE_TOOLS as _MT
+            for machine_name, (cell, tools) in _MT.items():
+                register_machine(machine_name, cell, tools)
+            print("Machines registered in DB.")
+        except Exception:
+            pass
+
+    # Restore active orders from DB into MES
+    if get_active_client_orders is not None:
+        try:
+            pending = get_active_client_orders()
+            restored = 0
+            for entry in pending:
+                client = entry['client']
+                co = entry['client_order']
+                orders = entry['orders']
+                # Build ClientOrder object
+                from orders import ClientOrder as COCls, Order as ProdOrder
+                client_order_obj = COCls(name=client['name'], NIF=client['nif'], OrderID=co['external_order_id'], orders=[])
+                db_ids = []
+                for line in orders:
+                    client_order_obj.orders.append(ProdOrder(type=line['type'], quantity=line['quantity'], DDate=line['DDate'], Penalty=line['penalty']))
+                    db_ids.append(line.get('order_id'))
+                mes.on_client_order(client_order_obj, db_order_ids=db_ids)
+                restored += 1
+            print(f"Restored {restored} client orders into MES from DB.")
+        except Exception as e:
+            print(f"Warning: could not restore orders from DB: {e}")
+
+    # Start receiver: create a wrapper that first saves incoming orders to DB, then injects to MES
+    receiver = None
+    if save_to_db is not None:
+        from order_receiver import OrderReceiver
+        def _on_received_and_save(client_order):
+            try:
+                order_ids = save_to_db(client_order) or []
+            except Exception as e:
+                print(f"Error saving incoming order to DB: {e}")
+                order_ids = []
+            try:
+                mes.on_client_order(client_order, db_order_ids=order_ids)
+            except Exception as e:
+                print(f"Error injecting order into MES: {e}")
+
+        receiver = OrderReceiver(host=args.bind, port=args.port, on_order_received=_on_received_and_save)
+        receiver.start_server()
+        threading.Thread(target=receiver.receive_orders, daemon=True, name="order-receiver").start()
+    else:
+        # fallback: let MES start its own receiver which will call mes.on_client_order
+        mes.start_receiver()
 
     scheduler = threading.Thread(target=mes.run, daemon=True, name="mes-scheduler")
     scheduler.start()
@@ -265,6 +331,12 @@ Examples
 
     _banner("Shutting down")
     mes.stop()
+    # stop receiver we started here (if any)
+    if receiver is not None:
+        try:
+            receiver.stop_server()
+        except Exception:
+            pass
     scheduler.join(timeout=5.0)
     plc.disconnect()
     mes.print_stats()
