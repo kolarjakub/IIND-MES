@@ -348,6 +348,8 @@ def record_tool_usage(machine_name: str, tool_name: str,
                     pieces_processed = mes.tool_usage.pieces_processed + EXCLUDED.pieces_processed,
                     updated_at       = NOW();
         """, (tool_name, duration_s, pieces, machine_name))
+        if cursor.rowcount == 0:
+            print(f"Warning: no machine found for tool usage record '{machine_name}'")
         connection.commit()
     except Exception as e:
         print(f"Error recording tool usage for {machine_name}/{tool_name}: {e}")
@@ -357,6 +359,12 @@ def record_tool_usage(machine_name: str, tool_name: str,
             pass
     finally:
         db_disconnect(connection)
+
+
+def update_tool_usage(machine_id: str, tool_name: str,
+                      total_time_s: float, pieces_processed: int):
+    """Compatibility wrapper used by MES for tool usage updates."""
+    record_tool_usage(machine_id, tool_name, total_time_s, pieces_processed)
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +393,8 @@ def snapshot_machine_stats(machine_name: str, total_op_time_s: float,
             SELECT machine_id, %s, %s, %s, %s
             FROM mes.machines WHERE name = %s;
         """, (total_op_time_s, occupation_pct, tool_changes, pieces_total, machine_name))
+        if cursor.rowcount == 0:
+            print(f"Warning: no machine found for machine stats snapshot '{machine_name}'")
         connection.commit()
     except Exception as e:
         print(f"Error snapshotting stats for {machine_name}: {e}")
@@ -394,6 +404,13 @@ def snapshot_machine_stats(machine_name: str, total_op_time_s: float,
             pass
     finally:
         db_disconnect(connection)
+
+
+def update_machine_stats(machine_id: str, total_op_time_s: float,
+                         occupation_pct: float, tool_changes: int,
+                         pieces_total: int):
+    """Compatibility wrapper used by MES for machine stats snapshots."""
+    snapshot_machine_stats(machine_id, total_op_time_s, occupation_pct, tool_changes, pieces_total)
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +445,11 @@ def record_unload(dock_id: int, piece_type: str, count: int = 1):
             pass
     finally:
         db_disconnect(connection)
+
+
+def update_unload_stats(dock_id: int, piece_type: str, count: int = 1):
+    """Compatibility wrapper used by MES for unload stats updates."""
+    record_unload(dock_id, piece_type, count)
 
 
 # ---------------------------------------------------------------------------
@@ -512,10 +534,10 @@ def get_pending_orders():
         return []
     try:
         cursor.execute("""
-            SELECT order_id, type, quantity, "DDate", penalty, priority, created_at
+            SELECT order_id, type, quantity, ddate AS DDate, penalty, priority, created_at
             FROM mes.orders
             WHERE status = 'PENDING'
-            ORDER BY priority ASC NULLS LAST, "DDate" ASC, penalty DESC;
+            ORDER BY priority ASC NULLS LAST, ddate ASC, penalty DESC;
         """)
         cols = [d[0] for d in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
@@ -622,7 +644,7 @@ def get_active_client_orders(statuses=('PENDING', 'IN_PROGRESS')):
             SELECT o.order_id AS order_id,
                    o.type AS type,
                    o.quantity AS quantity,
-                   o."DDate" AS DDate,
+                   o.ddate AS DDate,
                    o.penalty AS penalty,
                    o.priority AS priority,
                    o.status AS status,
@@ -717,6 +739,11 @@ _MACHINE_TOOLS = {
     'M4a': ('C4', ['T4', 'T5', 'T6']),
     'M4b': ('C4', ['T4', 'T5', 'T6']),
     'M4c': ('C4', ['T8', 'T9', 'T10']),
+    # Generic cell-level aggregate machines for MES summary stats
+    'C1': ('C1', []),
+    'C2': ('C2', []),
+    'C3': ('C3', []),
+    'C4': ('C4', []),
 }
 
 if __name__ == "__main__":

@@ -413,6 +413,7 @@ class OpcUaHandler:
         self.password   = password
         self.client     = Client(server_url)
         self.connected  = False
+        self._procedure_details = {}
 
     # -- Connection -----------------------------------------------------------
 
@@ -457,6 +458,34 @@ class OpcUaHandler:
         except Exception as e:
             logger.error(f"[OpcUaHandler] Write failed '{path}': {e}")
             return False
+
+    def _cache_recipe_slots(self, slots: list):
+        for slot in slots:
+            proc_id = slot.get("ID_Procedure")
+            if proc_id:
+                self._procedure_details[int(proc_id)] = slot.copy()
+
+    def _read_recipe_slot_details(self, procedure_id: int):
+        for i in range(13):
+            try:
+                proc_id = int(self._read(f"MES_Recipe.Slots[{i}].ID_Procedure"))
+            except Exception:
+                continue
+            if proc_id != procedure_id:
+                continue
+            try:
+                return {
+                    "ID_Recipe":      int(self._read(f"MES_Recipe.Slots[{i}].ID_Recipe")),
+                    "Cell":           int(self._read(f"MES_Recipe.Slots[{i}].Cell")),
+                    "Tool":           int(self._read(f"MES_Recipe.Slots[{i}].Tool")),
+                    "Tool_Time_Sec":  int(self._read(f"MES_Recipe.Slots[{i}].Tool_Time_Sec")),
+                    "Piece_Type":     int(self._read(f"MES_Recipe.Slots[{i}].Piece_Type")),
+                    "Piece_Material": int(self._read(f"MES_Recipe.Slots[{i}].Piece_Material")),
+                    "For_Assembly":   bool(self._read(f"MES_Recipe.Slots[{i}].For_Assembly")),
+                }
+            except Exception:
+                return None
+        return None
 
     # -- Procedure limits -----------------------------------------------------
 
@@ -551,6 +580,7 @@ class OpcUaHandler:
         if not self.write_recipe(slots):
             print("[OpcUaHandler] Recipe write failed -- not triggering.")
             return False
+        self._cache_recipe_slots(slots)
         return self.trigger_recipe()
 
     # -- MES reads ------------------------------------------------------------
@@ -616,22 +646,73 @@ class OpcUaHandler:
 
     def read_procedures(self, max_slots: int = 10) -> list:
         """
-        Return active procedures (status != IDLE=0 and != COMPLETED=4).
+        Return procedure state records from MES_Procedures.
+        Full recipe metadata is resolved from cached dispatch data or from
+        MES_Recipe.Slots when available.
         Stops on the first slot with ID_Procedure == 0.
+        
+        Returns list of dicts with keys:
+          id, recipe, status, cell, tool, tool_time, piece_type,
+          piece_material, for_assembly, aborted
         """
         results = []
         for i in range(max_slots):
             try:
                 id_proc = int(self._read(f"MES_Procedures[{i}].ID_Procedure"))
-                if id_proc == 0:
-                    break
+            except Exception as e:
+                print(f"[OpcUaHandler] read_procedures: slot {i} read failed: {e}")
+                break
+
+            if id_proc == 0:
+                print(f"[OpcUaHandler] read_procedures: slot {i} empty")
+                continue
+
+            try:
                 status  = int(self._read(f"MES_Procedures[{i}].Status"))
                 aborted = bool(self._read(f"MES_Procedures[{i}].Successfully_Abort"))
-                if status not in (EProcedureStatus.IDLE, EProcedureStatus.COMPLETED):
-                    results.append({"id": id_proc, "status": status,
-                                    "aborted": aborted})
-            except Exception:
-                break
+            except Exception as e:
+                print(f"[OpcUaHandler] read_procedures: slot {i} state read failed: {e}")
+                continue
+
+            details = self._procedure_details.get(id_proc)
+            if details is None:
+                details = self._read_recipe_slot_details(id_proc)
+                if details is not None:
+                    self._procedure_details[id_proc] = details
+
+            if details is not None:
+                recipe = int(details.get("ID_Recipe", 0))
+                cell = int(details.get("Cell", 0))
+                tool = int(details.get("Tool", 0))
+                tool_time = int(details.get("Tool_Time_Sec", 0))
+                piece_type = int(details.get("Piece_Type", 0))
+                piece_material = int(details.get("Piece_Material", 0))
+                for_assembly = bool(details.get("For_Assembly", False))
+            else:
+                recipe = 0
+                cell = 0
+                tool = 0
+                tool_time = 0
+                piece_type = 0
+                piece_material = 0
+                for_assembly = False
+                print(f"[OpcUaHandler] read_procedures: slot {i} id={id_proc} details unavailable")
+
+            print(f"[OpcUaHandler] read_procedures: slot {i} id={id_proc} status={status} cell={cell} tool={tool} type={piece_type}")
+            results.append({
+                "id": id_proc,
+                "recipe": recipe,
+                "status": status,
+                "cell": cell,
+                "tool": tool,
+                "tool_time": tool_time,
+                "piece_type": piece_type,
+                "piece_material": piece_material,
+                "for_assembly": for_assembly,
+                "aborted": aborted,
+            })
+
+        print(f"[OpcUaHandler] read_procedures: returned {len(results)} records from {max_slots} slots")
         return results
 
     def read_cell_workstation_tracking(self, cell: str) -> dict:

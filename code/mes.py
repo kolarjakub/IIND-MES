@@ -44,10 +44,19 @@ from orders import (
     VALID_TYPES, ESTIMATED_TIME,
 )
 try:
-    from db_handler import update_order_status
+    from db_handler import (
+        update_order_status, update_tool_usage, update_machine_stats,
+        update_unload_stats
+    )
 except Exception:
     # db_handler may not be available in some test contexts
     def update_order_status(order_id, status):
+        return
+    def update_tool_usage(machine_id, tool_name, total_time_s, pieces_processed):
+        return
+    def update_machine_stats(machine_id, total_op_time_s, occupation_pct, tool_changes, pieces_total):
+        return
+    def update_unload_stats(dock_id, piece_type, count):
         return
 
 logger = logging.getLogger(__name__)
@@ -113,6 +122,13 @@ class MES:
         self._dispatched = 0
         self._failed     = 0
         self._day_cycles = 0
+        
+        # Statistics tracking for Requirement 4.3
+        self._completed_procedures = set()  # Track recorded procedure IDs
+        self._cell_tool_usage = {}          # {cell: {tool: {'time': s, 'pieces': n}}}
+        self._cell_occupation_start = {}    # {cell: start_time}
+        self._cell_total_time = {}          # {cell: total_seconds}
+        self._unload_counts = {}            # {piece_type: count}
 
         # Start unload timer
         threading.Thread(target=self._unload_loop, daemon=True,
@@ -296,10 +312,31 @@ class MES:
         with self._lock:
             count = self._pieces_today
         self._day_cycles += 1
+        
+        # Record machine statistics for each cell (end-of-day reporting)
+        for cell_name, tools_data in self._cell_tool_usage.items():
+            total_time = sum(t["time"] for t in tools_data.values())
+            total_pieces = sum(t["pieces"] for t in tools_data.values())
+            occupation_pct = (total_time / UNLOAD_INTERVAL * 100) if UNLOAD_INTERVAL > 0 else 0
+            tool_changes = len([t for t in tools_data.values() if t["pieces"] > 0])
+            
+            try:
+                update_machine_stats(
+                    machine_id=cell_name,
+                    total_op_time_s=total_time,
+                    occupation_pct=occupation_pct,
+                    tool_changes=tool_changes,
+                    pieces_total=total_pieces
+                )
+            except Exception as e:
+                _log(f"[stats] Error recording machine stats for {cell_name}: {e}")
+        
         _log(f"[unload] Day #{self._day_cycles} end -- "
              f"{count} piece(s) on unload docks -- resetting counter")
         with self._lock:
             self._pieces_today = 0
+            self._cell_tool_usage = {}
+            self._unload_counts = {}
 
     # ── Production ────────────────────────────────────────────────────────────
 
@@ -349,6 +386,7 @@ class MES:
         """
         Poll read_procedures(max_slots) every second until all clear.
         Same logic as test_recipes.poll_result -- returns True when done.
+        Records procedure statistics (tool usage, unload counts) as they complete.
         """
         time.sleep(2.0)   # give PLC a moment to start
         start      = time.time()
@@ -369,6 +407,17 @@ class MES:
                     _log(f"[production] PLC error "
                          f"code={e['code']} proc={e['procedure_id']}")
 
+                if n > 0:
+                    proc_info = ", ".join(
+                        f"id={p.get('id')} status={p.get('status')} cell={p.get('cell')} "
+                        f"tool={p.get('tool')} tt={p.get('tool_time')} type={p.get('piece_type')}"
+                        for p in procs
+                    )
+                    _log(f"[production] procedures: {proc_info}")
+
+                # Record statistics for completed procedures
+                self._record_procedure_statistics(procs)
+
                 if n != prev_count:
                     _log(f"[production]   [{elapsed:3d}s] procs={n}")
                     prev_count = n
@@ -387,7 +436,77 @@ class MES:
              f"(saw_active={saw_active})")
         return saw_active
 
-    # ── Priority helpers ──────────────────────────────────────────────────────
+    def _record_procedure_statistics(self, procedures: list):
+        """
+        Record machine, tool, and unload statistics from completed procedures.
+        
+        Cell mapping:  100=C1, 200=C2, 300=C3, 400=C4
+        Unload:        Cell=40 (U)
+        Tool mapping:  0=IDLE, 1-6=T1-T6, 8-11=T8-T11
+        """
+        from opcua_handler import EProcedureStatus, ELocation, ETool
+        
+        for proc in procedures:
+            proc_id = proc.get("id")
+            
+            # Skip if already recorded
+            if proc_id in self._completed_procedures:
+                continue
+            
+            # Only record completed procedures
+            if proc.get("status") != EProcedureStatus.COMPLETED:
+                continue
+            
+            # Mark as recorded
+            self._completed_procedures.add(proc_id)
+            
+            cell = proc.get("cell", 0)
+            tool = proc.get("tool", 0)
+            tool_time = proc.get("tool_time", 0)
+            piece_type = proc.get("piece_type", 0)
+            piece_material = proc.get("piece_material", 0)
+            
+            # Map cell ID to machine name (use cell ID as key for now)
+            cell_name = f"C{cell // 100}" if 100 <= cell <= 400 else f"CELL_{cell}"
+            _log(f"[stats] Procedure completed proc_id={proc_id} cell={cell_name} tool={tool} "
+                 f"tool_time={tool_time}s piece_type={piece_type}")
+            
+            # Record tool usage if tool was used (not IDLE)
+            if tool != ETool.IDLE and tool_time > 0 and cell in (100, 200, 300, 400):
+                tool_name = f"T{tool}"
+                if cell_name not in self._cell_tool_usage:
+                    self._cell_tool_usage[cell_name] = {}
+                if tool_name not in self._cell_tool_usage[cell_name]:
+                    self._cell_tool_usage[cell_name][tool_name] = {"time": 0, "pieces": 0}
+                
+                self._cell_tool_usage[cell_name][tool_name]["time"] += tool_time
+                self._cell_tool_usage[cell_name][tool_name]["pieces"] += 1
+                
+                try:
+                    update_tool_usage(
+                        machine_id=cell_name,
+                        tool_name=tool_name,
+                        total_time_s=tool_time,
+                        pieces_processed=1
+                    )
+                    _log(f"[stats] Tool usage wrote DB {cell_name}/{tool_name} +{tool_time}s")
+                except Exception as e:
+                    _log(f"[stats] Error recording tool usage: {e}")
+                
+            # Record unload statistics (pieces reaching unload station U=40)
+            if cell == ELocation.U:
+                self._unload_counts[piece_type] = self._unload_counts.get(piece_type, 0) + 1
+                
+                # Unload to dock 1 (can be extended to multiple docks)
+                try:
+                    update_unload_stats(
+                        dock_id=1,
+                        piece_type=piece_type,
+                        count=1
+                    )
+                    _log(f"[stats] Unload wrote DB dock=1 piece_type={piece_type}")
+                except Exception as e:
+                    _log(f"[stats] Error recording unload stats: {e}")
 
     def _recalculate_locked(self):
         for o in self._orders:
