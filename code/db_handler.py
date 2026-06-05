@@ -739,7 +739,10 @@ _MACHINE_TOOLS = {
     'M4a': ('C4', ['T4', 'T5', 'T6']),
     'M4b': ('C4', ['T4', 'T5', 'T6']),
     'M4c': ('C4', ['T8', 'T9', 'T10']),
-    # Generic cell-level aggregate machines for MES summary stats
+}
+
+# Cell-level aggregates (kept for UI/summary purposes only — not persisted as machines)
+_CELL_AGGREGATES = {
     'C1': ('C1', []),
     'C2': ('C2', []),
     'C3': ('C3', []),
@@ -764,6 +767,11 @@ if __name__ == "__main__":
 
     if not args.no_register:
         for machine_name, (cell, tools) in _MACHINE_TOOLS.items():
+            # Only register actual machines (names starting with 'M').
+            # Keep the cell-level entries in the dict for summary/UI purposes,
+            # but do not persist them as individual machines in the DB.
+            if not machine_name.startswith('M'):
+                continue
             register_machine(machine_name, cell, tools)
         print("All machines registered (upserted).")
     else:

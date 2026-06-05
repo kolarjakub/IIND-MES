@@ -271,6 +271,8 @@ Examples
         try:
             from db_handler import _MACHINE_TOOLS as _MT
             for machine_name, (cell, tools) in _MT.items():
+                if not machine_name.startswith('M'):
+                    continue
                 register_machine(machine_name, cell, tools)
             print("Machines registered in DB.")
         except Exception:
