@@ -13,7 +13,7 @@ init(autoreset=True)
 # Run directly via CLI with --host, --port, --accept-timeout flags; or import OrderReceiver and use it programmatically with a callback.
 
 class OrderReceiver:
-    def __init__(self, host='localhost', port=6666, accept_timeout=10, client_timeout=5, on_order_received=None):
+    def __init__(self, host='0.0.0.0', port=6666, accept_timeout=10, client_timeout=5, on_order_received=None):
         self.host = host
         self.port = port
         self.accept_timeout = accept_timeout
@@ -23,6 +23,15 @@ class OrderReceiver:
         self.orders_received = 0
         self.on_order_received = on_order_received  # Optional callback for when an order is received
         self.idle_started = time.time()
+
+        if on_order_received is None:
+            print(Fore.YELLOW + "No order received callback provided. Orders will be counted but not processed.")
+            self.on_order_received = []
+        elif callable(on_order_received):
+            self.on_order_received = [on_order_received]
+        else:
+            self.on_order_received = list(on_order_received)  # Assume it's an iterable of callables
+            
 
     def start_server(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -46,6 +55,8 @@ class OrderReceiver:
             except KeyboardInterrupt:
                 print(Fore.YELLOW + "\nShutting down gracefully...")
                 break
+            except OSError:
+                break  # socket closed by stop_server()
 
             print(Fore.CYAN + f"Connection from {addr}")
             client_sock.settimeout(self.client_timeout)
@@ -66,7 +77,8 @@ class OrderReceiver:
                         self.orders_received += 1
                         self.idle_started = time.time()
                         if self.on_order_received:
-                            self.on_order_received(order)
+                            for callback in self.on_order_received:
+                                callback(order)
                     except json.JSONDecodeError:
                         print(Fore.RED + f"Failed to decode JSON from {addr}")
                     except (KeyError, TypeError) as e:

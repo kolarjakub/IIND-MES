@@ -44,7 +44,7 @@ def generate_random_company_name(friend_names=None, words=None):
 def random_order():
     return Order(
         type=random.choice(VALID_TYPES),
-        quantity=random.randint(1, 20),
+        quantity=random.randint(1, 5),
         DDate=random.randint(5, 30),
         Penalty=random.randint(50, 500)
     )
