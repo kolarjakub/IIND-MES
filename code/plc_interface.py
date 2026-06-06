@@ -60,6 +60,27 @@ RAW_MATERIALS = {
 
 VALID_TYPES = list(ESTIMATED_TIME.keys())
 
+class Machine:
+    def __init__(self, cell: str, number):
+
+        self.cell = cell
+        self.number = number
+        self.tool_change = 0;
+        self.processed_piece = 0
+        self.total_time_per_tool = {1: 0, 2: 0, 3: 0}
+
+    def tool_change(self):
+        self.tool_change += 1
+    def process_piece(self, time, tool):
+        self.processed_piece += 1
+        self.total_time_per_tool[tool] += time
+
+    def get_tool_change(self):
+        return self.tool_change
+    def get_processed_piece(self):
+        return self.processed_piece
+    def get_total_time_per_tool(self):
+        return self.total_time_per_tool
 
 class PLCInterface:
 
@@ -167,6 +188,12 @@ class PLCInterface:
             "errors":     self.get_errors(),
             "procedures": self.get_procedures(),
         }
+    def get_machine_statistics(self) -> list:
+        """Machine statistics from MES_Machine_Statistics (all 12 machines)."""
+        try:
+            return self._handler.read_machine_statistics()
+        except Exception:
+            return []
 
     # -- Production -----------------------------------------------------------
 

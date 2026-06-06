@@ -554,6 +554,66 @@ class OpcUaHandler:
         return self.trigger_recipe()
 
     # -- MES reads ------------------------------------------------------------
+    def read_tool_change_tracking(self) -> dict:
+        """
+        Read ST_ToolChange_Tracking_MES.
+        Returns a dict of {(station, sub): bool} for all 12 flags.
+
+        Stations 1-4 = C1-C4.  Sub-stations 1-3 = the 3 workstations per cell.
+        True = tool change complete / station ready.
+        """
+        var  = "MES_ToolChange_Tracking"   # exact GVL variable name
+        result = {}
+        for station in range(1, 5):        # 1..4
+            for sub in range(1, 4):        # 1..3
+                field = f"Station{station}_{sub}"
+                try:
+                    result[(station, sub)] = bool(self._read(f"{var}.{field}"))
+                except Exception:
+                    result[(station, sub)] = False
+        print(f"[OpcUaHandler] Tool change tracking: {result}")
+        return result
+    def read_machine_statistics(self) -> list:
+        """
+        Read MES_Machine_Statistics.Machine[0..11].
+
+        Returns list of 12 dicts:
+          machine_index, operating_time (s), occupation_pct (%),
+          tool_times [T1,T2,T3] (s), tool_changes, pieces_total,
+          pieces_by_type [0..11]
+        """
+        N_MACHINES    = 12
+        N_TOOLS       = 3
+        N_PIECE_TYPES = 12
+        result = []
+        for i in range(N_MACHINES):
+            base = f"MES_Machine_Statistics.Machine[{i}]"
+            try:
+                result.append({
+                    "machine_index":  i,
+                    "operating_time": float(self._read(
+                        f"{base}.Total_Operating_Time")),
+                    "occupation_pct": float(self._read(
+                        f"{base}.Occupation_Percentage")),
+                    "tool_times":     [float(self._read(
+                        f"{base}.Total_Operating_Time_Tools[{j}]"))
+                        for j in range(N_TOOLS)],
+                    "tool_changes":   int(self._read(
+                        f"{base}.Number_Of_Tool_Changes")),
+                    "pieces_total":   int(self._read(
+                        f"{base}.Total_Number_Of_Operated_Workpieces")),
+                    "pieces_by_type": [int(self._read(
+                        f"{base}.Total_Number_Of_Operated_Workpieces_Each_Type[{k}]"))
+                        for k in range(N_PIECE_TYPES)],
+                })
+            except Exception:
+                result.append({
+                    "machine_index":  i, "operating_time": 0.0,
+                    "occupation_pct": 0.0, "tool_times": [0.0] * N_TOOLS,
+                    "tool_changes":   0,  "pieces_total": 0,
+                    "pieces_by_type": [0] * N_PIECE_TYPES,
+                })
+        return result
 
     def read_success(self) -> bool:
         return bool(self._read("MES_Success"))
