@@ -280,6 +280,7 @@ def build_recipe(
     id_piece_start:     int,
     id_final_piece:     int,
     unload_location:    int = ELocation.U,
+    slot_offset:        int = 0,
 ) -> list:
     """
     Build the 13-slot recipe for one piece (slot indices 0-12).
@@ -314,7 +315,7 @@ def build_recipe(
 
     def _slot(**kw):
         base = {
-            "N_Slot":                    len(slots),
+            "N_Slot":                    slot_offset + len(slots),
             "ID_Procedure":              id_procedure_start + len(slots),
             "ID_Recipe":                 id_recipe,
             "Status":                    EProcedureStatus.NEW_ORDER,

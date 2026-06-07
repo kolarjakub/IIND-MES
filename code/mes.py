@@ -22,7 +22,7 @@ UNLOAD_INTERVAL   = 60.0
 SCHEDULER_POLL    = 1.5
 PRODUCTION_POLL   = 1.0
 PRODUCTION_TIMEOUT= 300.0
-BATCH_SIZE        = 1
+BATCH_SIZE        = 3
 W1_THRESHOLD      = 20
 ORDER_HOST        = "0.0.0.0"
 ORDER_PORT        = 6666
@@ -55,39 +55,6 @@ class MES:
         self._day_cycles = 0
         threading.Thread(target=self._unload_loop, daemon=True,
                          name="unload-timer").start()
-        self._reload_orders_from_db()
-
-    def _reload_orders_from_db(self):
-        """Restore PENDING/IN_PROGRESS orders that survived a restart."""
-        try:
-            from db_handler import load_active_orders
-            rows = load_active_orders()
-            if not rows:
-                return
-            now = time.time()
-            with self._lock:
-                for row in rows:
-                    ao = ActiveOrder(
-                        client_order_id = row["external_order_id"],
-                        piece_type      = row["type"],
-                        quantity        = row["quantity"],
-                        quantity_done   = row["quantity_done"],
-                        ddate_days      = row["DDate"],
-                        penalty         = row["penalty"],
-                        status          = row["status"],
-                        started_at      = (
-                            row["created_at"].timestamp()
-                            if hasattr(row["created_at"], "timestamp")
-                            else now
-                        ),
-                    )
-                    ao.db_order_id = row["order_id"]
-                    ao.calculate_priority(IN_PROGRESS_BOOST)
-                    self._orders.append(ao)
-                self._sort_locked()
-            _log(f"[db] Reloaded {len(rows)} order(s) from DB")
-        except Exception as _e:
-            _log(f"[db] Order reload failed: {_e}")
 
     def on_client_order(self, client_order: ClientOrder):
         now = time.time()
@@ -114,11 +81,6 @@ class MES:
                  f"DDate={ao.ddate_days}d  Penalty={ao.penalty}  "
                  f"score={ao.priority:.3f}  ({client_order.name})")
         self._print_queue()
-        try:
-            from db_handler import save_to_db
-            save_to_db(client_order)
-        except Exception as _e:
-            _log(f"[db] save_to_db failed: {_e}")
 
     def add_materials(self, wood: int = 0, metal: int = 0):
         _log(f"[materials] add_materials called: wood={wood} metal={metal}  "
@@ -175,14 +137,6 @@ class MES:
                         order.quantity_done += 1
                         self._pieces_today += 1
                         self._dispatched += 1
-                        new_st = "COMPLETED" if order.quantity_done >= order.quantity else "IN_PROGRESS"
-                        try:
-                            from db_handler import record_unload, update_order_progress
-                            record_unload(dock_id=1, piece_type=order.piece_type, count=1)
-                            if order.db_order_id:
-                                update_order_progress(order.db_order_id, order.quantity_done, new_st)
-                        except Exception as _e:
-                            _log(f"[db] progress update failed: {_e}")
                         if order.quantity_done >= order.quantity:
                             order.status = "COMPLETED"
                             _log(f"[scheduler] ✓ Order #{order.db_order_id} "
@@ -213,13 +167,6 @@ class MES:
             self._do_unload()
             time.sleep(UNLOAD_INTERVAL)
 
-    _MACHINE_NAMES = [
-        'M1a','M1b','M1c',
-        'M2a','M2b','M2c',
-        'M3a','M3b','M3c',
-        'M4a','M4b','M4c',
-    ]
-
     def _do_unload(self):
         with self._lock:
             count = self._pieces_today
@@ -227,36 +174,11 @@ class MES:
         _log(f"[unload] Day #{self._day_cycles} end -- {count} piece(s) -- resetting")
         with self._lock:
             self._pieces_today = 0
-        self._snapshot_machine_stats_to_db()
-
-    def _snapshot_machine_stats_to_db(self):
-        """Snapshot PLC machine statistics to DB once per unload cycle."""
-        if self._plc is None:
-            return
-        try:
-            from db_handler import snapshot_machine_stats
-            machines = self._plc.get_machine_statistics()
-            for m in machines:
-                i = m["machine_index"]
-                if i >= len(self._MACHINE_NAMES):
-                    continue
-                if m["operating_time"] == 0 and m["pieces_total"] == 0:
-                    continue
-                snapshot_machine_stats(
-                    machine_name    = self._MACHINE_NAMES[i],
-                    total_op_time_s = m["operating_time"],
-                    occupation_pct  = m["occupation_pct"],
-                    tool_changes    = m["tool_changes"],
-                    pieces_total    = m["pieces_total"],
-                    piece_type  = m["pieces_by_type"],
-                )
-        except Exception as _e:
-            _log(f"[db] Machine stats snapshot failed: {_e}")
 
     def _dispatch_batch_and_wait(self, orders: list) -> bool:
         from opcua_handler import build_recipe
         all_slots = []
-        for order in orders:
+        for idx, order in enumerate(orders):
             id_rec, id_proc, id_piece, id_final = self._plc._alloc_ids()
             slots = build_recipe(
                 piece_type         = order.piece_type,
@@ -264,6 +186,7 @@ class MES:
                 id_procedure_start = id_proc,
                 id_piece_start     = id_piece,
                 id_final_piece     = id_final,
+                slot_offset        = idx * 13,   # each recipe occupies its own 13 slots
             )
             all_slots.extend(slots)
         n_slots = len(all_slots)
