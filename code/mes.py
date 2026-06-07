@@ -53,6 +53,7 @@ class MES:
         self._dispatched = 0
         self._failed     = 0
         self._day_cycles = 0
+        self._last_tool_times = {}   # machine_index -> [t0,t1,t2]
         threading.Thread(target=self._unload_loop, daemon=True,
                          name="unload-timer").start()
         self._reload_orders_from_db()
@@ -114,6 +115,11 @@ class MES:
                  f"DDate={ao.ddate_days}d  Penalty={ao.penalty}  "
                  f"score={ao.priority:.3f}  ({client_order.name})")
         self._print_queue()
+        try:
+            from db_handler import save_to_db
+            save_to_db(client_order)
+        except Exception as _e:
+            _log(f"[db] save_to_db failed: {_e}")
 
     def add_materials(self, wood: int = 0, metal: int = 0):
         _log(f"[materials] add_materials called: wood={wood} metal={metal}  "
@@ -209,13 +215,6 @@ class MES:
             self._pieces_today = 0
         self._snapshot_machine_stats_to_db()
 
-    _MACHINE_NAMES = [
-        'M1a','M1b','M1c',   # C1: indices 0-2
-        'M2a','M2b','M2c',   # C2: indices 3-5
-        'M3a','M3b','M3c',   # C3: indices 6-8
-        'M4a','M4b','M4c',   # C4: indices 9-11
-    ]
-
     def _snapshot_machine_stats_to_db(self):
         """Snapshot PLC machine statistics to DB once per unload cycle."""
         if self._plc is None:
@@ -235,8 +234,15 @@ class MES:
                     occupation_pct  = m["occupation_pct"],
                     tool_changes    = m["tool_changes"],
                     pieces_total    = m["pieces_total"],
-                    piece_type  = m["pieces_by_type"],
                 )
+                from db_handler import record_tool_usage
+                prev = self._last_tool_times.get(i, [0.0, 0.0, 0.0])
+                for j, t in enumerate(m["tool_times"]):
+                    delta = t - prev[j]
+                    if delta > 0:
+                        record_tool_usage(
+                            self._MACHINE_NAMES[i], f"T{j+1}", delta, 0)
+                self._last_tool_times[i] = list(m["tool_times"])
         except Exception as _e:
             _log(f"[db] Machine stats snapshot failed: {_e}")
 
