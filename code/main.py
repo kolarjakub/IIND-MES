@@ -70,7 +70,7 @@ def _print_banner():
     print(f"""
 {BOLD}{CYAN}
   ╔══════════════════════════════════════════════════════════╗
-  ║        Flexible Production Line  ·  MES Console         ║
+  ║        Flexible Production Line  ·  MES Console          ║
   ╚══════════════════════════════════════════════════════════╝
 {RESET}
   Type {BOLD}help{RESET} for available commands.

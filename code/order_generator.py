@@ -24,8 +24,9 @@ DEFAULT_WORDS = [
 ]
 # order_generator.py builds and sends JSON-encoded ClientOrder objects to the MES receiver over a TCP socket on port 6666.
 # Orders can be generated randomly (random company name, valid product type, quantity, delivery date, penalty) or entered manually via CLI prompts.
+# A third mode generates one order for every valid piece type with quantity fixed to 1.
 # Each order is validated before sending — checking NIF format, valid product types, positive quantities, and non-negative penalties.
-# Run with -r for a single random order, -m for manual input, or with no flags for an interactive loop (r/m/q to quit).
+# Run with -r for a single random order, -m for manual input, -e for every-piece mode, or with no flags for an interactive loop.
 # Import generate_random_client_order() and send_client_order() directly into other modules to programmatically fire orders without the CLI.
 
 
@@ -55,6 +56,22 @@ def generate_random_client_order():
         NIF=random.randint(100000000, 999999999),
         OrderID=random.randint(1, 1000),
         orders=[random_order() for _ in range(random.randint(1, 5))]
+    )
+
+def generate_every_piece_client_order():
+    return ClientOrder(
+        name=generate_random_company_name(),
+        NIF=random.randint(100000000, 999999999),
+        OrderID=random.randint(1, 1000),
+        orders=[
+            Order(
+                type=piece_type,
+                quantity=1,
+                DDate=random.randint(5, 30),
+                Penalty=random.randint(50, 500)
+            )
+            for piece_type in VALID_TYPES
+        ]
     )
 
 def manual_client_order():
@@ -116,6 +133,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate and send client orders")
     parser.add_argument('-r', '--random', action='store_true', help='Generate a random order')
     parser.add_argument('-m', '--manual', action='store_true', help='Manually enter an order')
+    parser.add_argument('-e', '--every-piece', action='store_true', help='Generate one order for each valid piece type with quantity 1')
     parser.add_argument('--host', default='localhost', help='Server host (default: localhost)')
     parser.add_argument('--port', type=int, default=6666, help='Server port (default: 6666)')
     
@@ -129,21 +147,29 @@ if __name__ == "__main__":
         order = manual_client_order()
         print(f"{Fore.GREEN}Created manual order:{Style.RESET_ALL} {order}")
         send_client_order(order, host=args.host, port=args.port)
+    elif args.every_piece:
+        order = generate_every_piece_client_order()
+        print(f"{Fore.GREEN}Generated every-piece order:{Style.RESET_ALL} {order}")
+        send_client_order(order, host=args.host, port=args.port)
     else:
         while True:
-            choice = input("Generate random order (r) or enter manually (m)? (r/m): ")
+            choice = input("Choose mode: random (1/r), manual (2/m), every-piece qty=1 (3/e), quit (q): ")
             match choice.lower():
-                case 'r':
+                case '1' | 'r':
                     order = generate_random_client_order()
                     print(f"{Fore.GREEN}Generated random order:{Style.RESET_ALL} {order}")
-                    send_client_order(order)
-                case 'm':
+                    send_client_order(order, host=args.host, port=args.port)
+                case '2' | 'm':
                     order = manual_client_order()
                     print(f"{Fore.GREEN}Created manual order:{Style.RESET_ALL} {order}")
-                    send_client_order(order)
+                    send_client_order(order, host=args.host, port=args.port)
+                case '3' | 'e':
+                    order = generate_every_piece_client_order()
+                    print(f"{Fore.GREEN}Generated every-piece order:{Style.RESET_ALL} {order}")
+                    send_client_order(order, host=args.host, port=args.port)
                 case 'q':
                     print("Exiting...")
                     break
                 case _:
-                    print(f"{Fore.RED}Invalid choice, please enter 'r', 'm', or 'q'{Style.RESET_ALL}")    
+                    print(f"{Fore.RED}Invalid choice, please enter '1/2/3', 'r/m/e', or 'q'{Style.RESET_ALL}")
 

@@ -69,6 +69,7 @@ def db_init():
                 client_order_id INT REFERENCES mes.client_orders(client_order_id) ON DELETE CASCADE,
                 type            VARCHAR(255) NOT NULL,
                 quantity        INT  NOT NULL,
+                quantity_done   INT  NOT NULL DEFAULT 0,
                 DDate           INT  NOT NULL,
                 penalty         INT  NOT NULL,
                 priority        INT  DEFAULT NULL,
@@ -725,6 +726,62 @@ def update_order_status(order_id: int, status: str):
             connection.rollback()
         except Exception:
             pass
+    finally:
+        db_disconnect(connection)
+
+
+def update_order_progress(order_id: int, quantity_done: int, status: str):
+    """Update quantity_done and status together after each piece completes.
+
+    Args:
+        order_id:      mes.orders.order_id
+        quantity_done: how many pieces have been produced so far
+        status:        'PENDING' | 'IN_PROGRESS' | 'COMPLETED'
+    """
+    cursor, connection = db_connect()
+    if cursor is None:
+        return
+    try:
+        cursor.execute("""
+            UPDATE mes.orders
+            SET quantity_done = %s, status = %s
+            WHERE order_id = %s;
+        """, (quantity_done, status, order_id))
+        connection.commit()
+    except Exception as e:
+        print(f"Error updating progress for order {order_id}: {e}")
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+    finally:
+        db_disconnect(connection)
+
+
+def load_active_orders() -> list:
+    """Reload PENDING and IN_PROGRESS orders for MES restart recovery.
+
+    Returns list of dicts with keys needed to rebuild ActiveOrder:
+        order_id, type, quantity, quantity_done, DDate, penalty, status, created_at
+    """
+    cursor, connection = db_connect()
+    if cursor is None:
+        return []
+    try:
+        cursor.execute("""
+            SELECT o.order_id, o.type, o.quantity, o.quantity_done,
+                   o."DDate", o.penalty, o.status, o.created_at,
+                   co.external_order_id
+            FROM mes.orders o
+            JOIN mes.client_orders co ON o.client_order_id = co.client_order_id
+            WHERE o.status IN ('PENDING', 'IN_PROGRESS')
+            ORDER BY o.order_id;
+        """)
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+    except Exception as e:
+        print(f"Error loading active orders: {e}")
+        return []
     finally:
         db_disconnect(connection)
 
