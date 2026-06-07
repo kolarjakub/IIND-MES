@@ -54,7 +54,7 @@ class MES:
         self._failed     = 0
         self._day_cycles = 0
         self._last_tool_times = {}   # machine_index -> [t0,t1,t2]
-        self._MACHINE_NAMES = ["M1a", "M1b", "M2a", "M2b", "M3a", "M3b", "M4a", "M4b"]
+        self._MACHINE_NAMES = ["M1a", "M1b", "M1c", "M2a", "M2b", "M2c", "M3a", "M3b", "M3c", "M4a", "M4b", "M4c"]
         threading.Thread(target=self._unload_loop, daemon=True,
                          name="unload-timer").start()
         self._reload_orders_from_db()
