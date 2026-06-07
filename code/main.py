@@ -87,6 +87,7 @@ def _print_help():
   {CYAN}queue{RESET}   (q)   Live priority queue
   {CYAN}add{RESET}     (a)   Inject a production order now
   {CYAN}day{RESET}           Force an immediate unload cycle
+  {CYAN}dashboard{RESET} (d)   Live terminal dashboard (pip install rich)
   {CYAN}help{RESET}    (?)   Show this help
   {CYAN}exit{RESET}          Stop MES and quit
   ─────────────────────────────────────────────────────────
@@ -154,6 +155,7 @@ def _run_console(mes: MES):
     ALIASES = {
         "s": "status", "q": "queue", "a": "add",
         "?": "help",   "h": "help",  "quit": "exit",
+        "d":    "dashboard",
     }
 
     while True:
@@ -170,6 +172,13 @@ def _run_console(mes: MES):
         elif cmd == "day":
             print(f"\n  {YELLOW}Forcing unload cycle...{RESET}")
             mes._do_unload(); print()
+        elif cmd == "dashboard":
+            try:
+                from dashboard import run_dashboard
+                print(f"  {CYAN}Dashboard active -- Ctrl+C to return{RESET}")
+                run_dashboard(mes=mes, plc=mes._plc)
+            except ImportError:
+                print(f"  {RED}Install rich: pip install rich{RESET}")
         elif cmd == "help":   _print_help()
         elif cmd == "exit":
             print(f"\n  {YELLOW}Stopping MES...{RESET}")
