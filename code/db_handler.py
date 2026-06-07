@@ -55,6 +55,7 @@ def db_init():
                 name        VARCHAR(255) NOT NULL,
                 nif         BIGINT,
                 created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (nif),
                 UNIQUE (name, nif)
             )""",
             """CREATE TABLE mes.client_orders (
@@ -70,7 +71,7 @@ def db_init():
                 type            VARCHAR(255) NOT NULL,
                 quantity        INT  NOT NULL,
                 quantity_done   INT  NOT NULL DEFAULT 0,
-                DDate           INT  NOT NULL,
+                ddate           INT  NOT NULL,
                 penalty         INT  NOT NULL,
                 priority        INT  DEFAULT NULL,
                 created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -138,6 +139,38 @@ def db_init():
 
         connection.commit()
         print("Schema mes created successfully.")
+
+        # ------------------------------------------------------------------
+        # Initial machine population
+        # ------------------------------------------------------------------
+        for machine_name, (cell, tools) in _MACHINE_TOOLS.items():
+            cursor.execute("""
+                INSERT INTO mes.machines (name, cell, available_tools)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (name) DO NOTHING
+                RETURNING machine_id;
+            """, (machine_name, cell, tools))
+
+            row = cursor.fetchone()
+            if row:
+                machine_id = row[0]
+            else:
+                cursor.execute(
+                    "SELECT machine_id FROM mes.machines WHERE name=%s",
+                    (machine_name,)
+                )
+                machine_id = cursor.fetchone()[0]
+
+            for tool in tools:
+                cursor.execute("""
+                    INSERT INTO mes.tools (machine_id, tool_name, is_mounted)
+                    VALUES (%s, %s, FALSE)
+                    ON CONFLICT (machine_id, tool_name) DO NOTHING;
+                """, (machine_id, tool))
+
+        connection.commit()
+        print("All machines registered.")
+
     except Exception as e:
         print(f"Error creating schema: {e}")
         try:
@@ -149,11 +182,11 @@ def db_init():
 
 
 # ---------------------------------------------------------------------------
-# ERP / order queries  (original logic, kept intact)
+# ERP / order queries
 # ---------------------------------------------------------------------------
 
 _insert_order_q = """
-    INSERT INTO mes.orders (client_order_id, type, quantity, DDate, penalty, priority, status)
+    INSERT INTO mes.orders (client_order_id, type, quantity, ddate, penalty, priority, status)
     VALUES (%s, %s, %s, %s, %s, %s, 'PENDING')
     RETURNING order_id;
 """
@@ -164,17 +197,15 @@ _insert_client_order_q = """
     ON CONFLICT (external_order_id, client_id) DO NOTHING
     RETURNING client_order_id;
 """
+
+# ON CONFLICT on nif alone (single-column UNIQUE constraint added above)
 _insert_client_q = """
     INSERT INTO mes.clients (name, nif)
     VALUES (%s, %s)
-    ON CONFLICT (name, nif) DO UPDATE SET name = EXCLUDED.name
+    ON CONFLICT (nif)
+    DO UPDATE SET name = EXCLUDED.name
     RETURNING client_id;
 """
-
-# _insert_order_q = """
-#     INSERT INTO mes.orders (client_order_id, type, quantity, DDate, penalty, priority, status)
-#     VALUES (%s, %s, %s, %s, %s, %s, 'PENDING');
-# """
 
 
 def save_to_db(client_order):
@@ -190,8 +221,8 @@ def save_to_db(client_order):
             client_id = row[0]
         else:
             cursor.execute(
-                "SELECT client_id FROM mes.clients WHERE name=%s AND nif=%s",
-                (client_order.name, client_order.NIF)
+                "SELECT client_id FROM mes.clients WHERE nif=%s",
+                (client_order.NIF,)
             )
             client_id = cursor.fetchone()[0]
 
@@ -237,14 +268,6 @@ def save_to_db(client_order):
 # ---------------------------------------------------------------------------
 
 def register_machine(name: str, cell: str, tools: list[str]):
-    """Insert a machine and its tool warehouse. Safe to call at startup.
-
-    Args:
-        name:  machine identifier, e.g. 'M1a'
-        cell:  cell identifier, e.g. 'C1'
-        tools: list of tool names available in this machine's warehouse,
-               e.g. ['T1', 'T2', 'T3']
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return
@@ -281,13 +304,6 @@ def register_machine(name: str, cell: str, tools: list[str]):
 
 
 def update_machine_state(name: str, current_tool: str = None, mode: str = None):
-    """Update the live state of a machine (tool change or mode change).
-
-    Args:
-        name:         machine name, e.g. 'M1a'
-        current_tool: tool currently mounted, e.g. 'T2' (None = no change)
-        mode:         one of 'automatic', 'manual', 'maintenance' (None = no change)
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return
@@ -298,7 +314,6 @@ def update_machine_state(name: str, current_tool: str = None, mode: str = None):
                 SET current_tool = %s, updated_at = NOW()
                 WHERE name = %s;
             """, (current_tool, name))
-            # flip is_mounted in tools table
             cursor.execute("""
                 UPDATE mes.tools SET is_mounted = (tool_name = %s)
                 WHERE machine_id = (SELECT machine_id FROM mes.machines WHERE name = %s);
@@ -323,19 +338,11 @@ def update_machine_state(name: str, current_tool: str = None, mode: str = None):
 
 
 # ---------------------------------------------------------------------------
-# Tool usage queries  (called after every machining operation)
+# Tool usage queries
 # ---------------------------------------------------------------------------
 
 def record_tool_usage(machine_name: str, tool_name: str,
                       duration_s: float, pieces: int = 1):
-    """Upsert cumulative tool-usage counters for one machining operation.
-
-    Args:
-        machine_name: e.g. 'M1a'
-        tool_name:    e.g. 'T1'
-        duration_s:   how long the tool ran (seconds)
-        pieces:       number of pieces produced in this operation (usually 1)
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return
@@ -345,7 +352,7 @@ def record_tool_usage(machine_name: str, tool_name: str,
             SELECT machine_id, %s, %s, %s
             FROM mes.machines WHERE name = %s
             ON CONFLICT (machine_id, tool_name) DO UPDATE
-                SET total_time_s    = mes.tool_usage.total_time_s    + EXCLUDED.total_time_s,
+                SET total_time_s     = mes.tool_usage.total_time_s     + EXCLUDED.total_time_s,
                     pieces_processed = mes.tool_usage.pieces_processed + EXCLUDED.pieces_processed,
                     updated_at       = NOW();
         """, (tool_name, duration_s, pieces, machine_name))
@@ -366,15 +373,13 @@ def record_tool_usage(machine_name: str, tool_name: str,
 
 def snapshot_machine_stats(machine_name: str, total_op_time_s: float,
                             occupation_pct: float, tool_changes: int,
-                            pieces_total: int):
-    """Append a stats snapshot for one machine.  Grafana reads this as a time series.
+                            pieces_total: int,
+                            # kept for backward-compat with mes.py caller — ignored
+                            tool_times=None, pieces_by_type=None):
+    """Append a stats snapshot row for one machine.
 
-    Args:
-        machine_name:    e.g. 'M1a'
-        total_op_time_s: cumulative operating time in seconds
-        occupation_pct:  0..100 percentage
-        tool_changes:    cumulative number of tool changes
-        pieces_total:    cumulative pieces processed
+    tool_times / pieces_by_type are accepted but not stored (columns removed
+    from the simplified schema).  Grafana reads recorded_at as the time axis.
     """
     cursor, connection = db_connect()
     if cursor is None:
@@ -402,13 +407,6 @@ def snapshot_machine_stats(machine_name: str, total_op_time_s: float,
 # ---------------------------------------------------------------------------
 
 def record_unload(dock_id: int, piece_type: str, count: int = 1):
-    """Increment the unload counter for a given dock and piece type.
-
-    Args:
-        dock_id:    1..5
-        piece_type: e.g. 'RWW'
-        count:      number of pieces unloaded (default 1)
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return
@@ -437,14 +435,6 @@ def record_unload(dock_id: int, piece_type: str, count: int = 1):
 
 def log_production_start(order_id: int, machine_name: str, piece_type: str,
                           tool_name: str = None) -> int | None:
-    """Log the start of processing one piece. Returns the new log_id.
-
-    Args:
-        order_id:     mes.orders.order_id this piece belongs to
-        machine_name: e.g. 'M1a'
-        piece_type:   e.g. 'RtopW'
-        tool_name:    tool currently mounted, e.g. 'T1'
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return None
@@ -471,12 +461,6 @@ def log_production_start(order_id: int, machine_name: str, piece_type: str,
 
 
 def log_production_end(log_id: int, success: bool = True):
-    """Mark a production log entry as completed or failed.
-
-    Args:
-        log_id:  the id returned by log_production_start
-        success: True → 'completed', False → 'failed'
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return
@@ -499,24 +483,19 @@ def log_production_end(log_id: int, success: bool = True):
 
 
 # ---------------------------------------------------------------------------
-# Order status helpers  (used by MES scheduler)
+# Order status helpers
 # ---------------------------------------------------------------------------
 
 def get_pending_orders():
-    """Return all PENDING orders sorted by DDate ascending (earliest deadline first).
-
-    Returns list of dicts with keys:
-        order_id, type, quantity, DDate, penalty, created_at
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return []
     try:
         cursor.execute("""
-            SELECT order_id, type, quantity, "DDate", penalty, priority, created_at
+            SELECT order_id, type, quantity, "ddate", penalty, priority, created_at
             FROM mes.orders
             WHERE status = 'PENDING'
-            ORDER BY priority ASC NULLS LAST, "DDate" ASC, penalty DESC;
+            ORDER BY priority ASC NULLS LAST, "ddate" ASC, penalty DESC;
         """)
         cols = [d[0] for d in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
@@ -528,11 +507,6 @@ def get_pending_orders():
 
 
 def get_orders_by_client(client_id: int | None = None, name: str | None = None, nif: int | None = None):
-    """Return all client_orders for a client, including their order lines.
-
-    Provide either client_id or name+NIF to identify the client.
-    Returns a list of dicts with keys: client_order_id, external_order_id, created_at, orders (list).
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return []
@@ -546,18 +520,26 @@ def get_orders_by_client(client_id: int | None = None, name: str | None = None, 
                 return []
             client_id = row[0]
 
-        cursor.execute("SELECT client_order_id, external_order_id, created_at FROM mes.client_orders WHERE client_id=%s ORDER BY created_at DESC", (client_id,))
+        cursor.execute(
+            "SELECT client_order_id, external_order_id, created_at "
+            "FROM mes.client_orders WHERE client_id=%s ORDER BY created_at DESC",
+            (client_id,)
+        )
         orders = []
         for co_row in cursor.fetchall():
             co_id, external_id, created_at = co_row
-            cursor.execute("SELECT order_id, type, quantity, \"DDate\", penalty, priority, status, created_at FROM mes.orders WHERE client_order_id=%s ORDER BY order_id", (co_id,))
+            cursor.execute(
+                'SELECT order_id, type, quantity, "ddate", penalty, priority, status, created_at '
+                "FROM mes.orders WHERE client_order_id=%s ORDER BY order_id",
+                (co_id,)
+            )
             cols = [d[0] for d in cursor.description]
             lines = [dict(zip(cols, r)) for r in cursor.fetchall()]
             orders.append({
                 'client_order_id': co_id,
                 'external_order_id': external_id,
                 'created_at': created_at,
-                'orders': lines
+                'orders': lines,
             })
         return orders
     except Exception as e:
@@ -568,29 +550,41 @@ def get_orders_by_client(client_id: int | None = None, name: str | None = None, 
 
 
 def get_client_order_details(external_order_id: int, client_id: int | None = None):
-    """Return full details for a client_order identified by external_order_id (and optional client_id).
-
-    Returns a dict with client info and the list of order lines, or None if not found.
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return None
     try:
         if client_id is None:
-            cursor.execute("SELECT co.client_order_id, c.client_id, c.name, c.nif, co.created_at FROM mes.client_orders co JOIN mes.clients c USING (client_id) WHERE co.external_order_id=%s", (external_order_id,))
+            cursor.execute(
+                "SELECT co.client_order_id, c.client_id, c.name, c.nif, co.created_at "
+                "FROM mes.client_orders co JOIN mes.clients c USING (client_id) "
+                "WHERE co.external_order_id=%s",
+                (external_order_id,)
+            )
         else:
-            cursor.execute("SELECT co.client_order_id, c.client_id, c.name, c.nif, co.created_at FROM mes.client_orders co JOIN mes.clients c USING (client_id) WHERE co.external_order_id=%s AND c.client_id=%s", (external_order_id, client_id))
+            cursor.execute(
+                "SELECT co.client_order_id, c.client_id, c.name, c.nif, co.created_at "
+                "FROM mes.client_orders co JOIN mes.clients c USING (client_id) "
+                "WHERE co.external_order_id=%s AND c.client_id=%s",
+                (external_order_id, client_id)
+            )
         row = cursor.fetchone()
         if not row:
             return None
         client_order_id, client_id, name, nif, co_created = row
-        cursor.execute("SELECT order_id, type, quantity, \"DDate\", penalty, priority, status, created_at FROM mes.orders WHERE client_order_id=%s ORDER BY order_id", (client_order_id,))
+        cursor.execute(
+            'SELECT order_id, type, quantity, "ddate", penalty, priority, status, created_at '
+            "FROM mes.orders WHERE client_order_id=%s ORDER BY order_id",
+            (client_order_id,)
+        )
         cols = [d[0] for d in cursor.description]
         lines = [dict(zip(cols, r)) for r in cursor.fetchall()]
         return {
             'client': {'client_id': client_id, 'name': name, 'nif': nif},
-            'client_order': {'client_order_id': client_order_id, 'external_order_id': external_order_id, 'created_at': co_created},
-            'orders': lines
+            'client_order': {'client_order_id': client_order_id,
+                             'external_order_id': external_order_id,
+                             'created_at': co_created},
+            'orders': lines,
         }
     except Exception as e:
         print(f"Error fetching client order details: {e}")
@@ -600,29 +594,22 @@ def get_client_order_details(external_order_id: int, client_id: int | None = Non
 
 
 def get_orders_due_on(target_date):
-    """Return orders whose computed due date (client_order.created_at + DDate days) falls on target_date.
-
-    target_date can be a datetime.date or a string in 'YYYY-MM-DD' format.
-    Returns list of order dicts including client and client_order information.
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return []
     try:
-        # Compare date component of (client_orders.created_at + orders.DDate * interval '1 day')
-        cursor.execute(
-            """
-            SELECT o.order_id, o.type, o.quantity, o."DDate", o.penalty, o.priority, o.status,
+        cursor.execute("""
+            SELECT o.order_id, o.type, o.quantity, o."ddate", o.penalty, o.priority, o.status,
                    co.client_order_id, co.external_order_id, co.created_at AS co_created,
                    c.client_id, c.name, c.nif,
-                   (co.created_at + (o."DDate" || ' days')::interval) AS due_at
+                   (co.created_at + (o."ddate" || ' days')::interval) AS due_at
             FROM mes.orders o
             JOIN mes.client_orders co ON o.client_order_id = co.client_order_id
             JOIN mes.clients c ON co.client_id = c.client_id
-            WHERE date_trunc('day', co.created_at + (o."DDate" || ' days')::interval) = date_trunc('day', %s::timestamp)
+            WHERE date_trunc('day', co.created_at + (o."ddate" || ' days')::interval)
+                = date_trunc('day', %s::timestamp)
             ORDER BY due_at, o.order_id;
-            """, (str(target_date),)
-        )
+        """, (str(target_date),))
         cols = [d[0] for d in cursor.description]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
     except Exception as e:
@@ -633,45 +620,21 @@ def get_orders_due_on(target_date):
 
 
 def get_active_client_orders(statuses=('PENDING', 'IN_PROGRESS')):
-    """Return active orders (PENDING or IN_PROGRESS) grouped by client_order.
-
-    Each entry in the returned list has the shape:
-        {
-            'client': {'client_id', 'name', 'nif'},
-            'client_order': {'client_order_id', 'external_order_id', 'created_at'},
-            'orders': [ { order fields... }, ... ]
-        }
-
-    Useful for ERP/MES UI to show which client orders are still active and their lines.
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return []
     try:
-        cursor.execute(
-            """
-            SELECT o.order_id AS order_id,
-                   o.type AS type,
-                   o.quantity AS quantity,
-                   o."DDate" AS DDate,
-                   o.penalty AS penalty,
-                   o.priority AS priority,
-                   o.status AS status,
-                   o.created_at AS order_created_at,
-                   co.client_order_id AS client_order_id,
-                   co.external_order_id AS external_order_id,
-                   co.created_at AS client_order_created_at,
-                   c.client_id AS client_id,
-                   c.name AS client_name,
-                   c.nif AS client_nif
+        cursor.execute("""
+            SELECT o.order_id, o.type, o.quantity, o."ddate", o.penalty,
+                   o.priority, o.status, o.created_at,
+                   co.client_order_id, co.external_order_id, co.created_at,
+                   c.client_id, c.name, c.nif
             FROM mes.orders o
             JOIN mes.client_orders co ON o.client_order_id = co.client_order_id
             JOIN mes.clients c ON co.client_id = c.client_id
             WHERE o.status = ANY(%s)
             ORDER BY co.client_order_id, o.order_id;
-            """,
-            (list(statuses),)
-        )
+        """, (list(statuses),))
 
         groups = {}
         for row in cursor.fetchall():
@@ -682,19 +645,15 @@ def get_active_client_orders(statuses=('PENDING', 'IN_PROGRESS')):
             if client_order_id not in groups:
                 groups[client_order_id] = {
                     'client': {'client_id': client_id, 'name': client_name, 'nif': client_nif},
-                    'client_order': {'client_order_id': client_order_id, 'external_order_id': external_order_id, 'created_at': client_order_created_at},
-                    'orders': []
+                    'client_order': {'client_order_id': client_order_id,
+                                     'external_order_id': external_order_id,
+                                     'created_at': client_order_created_at},
+                    'orders': [],
                 }
-
             groups[client_order_id]['orders'].append({
-                'order_id': order_id,
-                'type': type_,
-                'quantity': quantity,
-                'DDate': DDate,
-                'penalty': penalty,
-                'priority': priority,
-                'status': status,
-                'created_at': order_created_at,
+                'order_id': order_id, 'type': type_, 'quantity': quantity,
+                'DDate': DDate, 'penalty': penalty, 'priority': priority,
+                'status': status, 'created_at': order_created_at,
             })
 
         return list(groups.values())
@@ -706,19 +665,12 @@ def get_active_client_orders(statuses=('PENDING', 'IN_PROGRESS')):
 
 
 def update_order_status(order_id: int, status: str):
-    """Set the status of an order.
-
-    Args:
-        order_id: mes.orders.order_id
-        status:   'PENDING' | 'IN_PROGRESS' | 'COMPLETED'
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return
     try:
-        cursor.execute("""
-            UPDATE mes.orders SET status = %s WHERE order_id = %s;
-        """, (status, order_id))
+        cursor.execute("UPDATE mes.orders SET status = %s WHERE order_id = %s;",
+                       (status, order_id))
         connection.commit()
     except Exception as e:
         print(f"Error updating order {order_id} status: {e}")
@@ -731,13 +683,6 @@ def update_order_status(order_id: int, status: str):
 
 
 def update_order_progress(order_id: int, quantity_done: int, status: str):
-    """Update quantity_done and status together after each piece completes.
-
-    Args:
-        order_id:      mes.orders.order_id
-        quantity_done: how many pieces have been produced so far
-        status:        'PENDING' | 'IN_PROGRESS' | 'COMPLETED'
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return
@@ -759,18 +704,13 @@ def update_order_progress(order_id: int, quantity_done: int, status: str):
 
 
 def load_active_orders() -> list:
-    """Reload PENDING and IN_PROGRESS orders for MES restart recovery.
-
-    Returns list of dicts with keys needed to rebuild ActiveOrder:
-        order_id, type, quantity, quantity_done, DDate, penalty, status, created_at
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return []
     try:
         cursor.execute("""
             SELECT o.order_id, o.type, o.quantity, o.quantity_done,
-                   o."DDate", o.penalty, o.status, o.created_at,
+                   o."ddate", o.penalty, o.status, o.created_at,
                    co.external_order_id
             FROM mes.orders o
             JOIN mes.client_orders co ON o.client_order_id = co.client_order_id
@@ -787,14 +727,10 @@ def load_active_orders() -> list:
 
 
 # ---------------------------------------------------------------------------
-# Grafana read-only helpers  (convenient for debugging / API endpoints)
+# Grafana read-only helpers
 # ---------------------------------------------------------------------------
 
 def get_tool_usage_summary():
-    """Return cumulative tool usage across all machines, ordered by total time.
-
-    Returns list of dicts: machine, tool_name, total_time_s, pieces_processed
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return []
@@ -816,10 +752,6 @@ def get_tool_usage_summary():
 
 
 def get_unload_summary():
-    """Return total unloaded pieces per dock and per type.
-
-    Returns list of dicts: dock_id, piece_type, count
-    """
     cursor, connection = db_connect()
     if cursor is None:
         return []
@@ -861,23 +793,19 @@ def db_truncate():
 
 
 # ---------------------------------------------------------------------------
-# Startup  — init schema + register all 12 machines with their tools
+# Machine definitions
 # ---------------------------------------------------------------------------
 
 _MACHINE_TOOLS = {
-    # Cell C1
     'M1a': ('C1', ['T1', 'T2', 'T3']),
     'M1b': ('C1', ['T1', 'T2', 'T3']),
     'M1c': ('C1', ['T8', 'T9', 'T11']),
-    # Cell C2
     'M2a': ('C2', ['T1', 'T2', 'T3']),
     'M2b': ('C2', ['T1', 'T2', 'T3']),
     'M2c': ('C2', ['T8', 'T9', 'T10']),
-    # Cell C3
     'M3a': ('C3', ['T4', 'T5', 'T6']),
     'M3b': ('C3', ['T4', 'T5', 'T6']),
     'M3c': ('C3', ['T8', 'T9', 'T11']),
-    # Cell C4
     'M4a': ('C4', ['T4', 'T5', 'T6']),
     'M4b': ('C4', ['T4', 'T5', 'T6']),
     'M4c': ('C4', ['T8', 'T9', 'T10']),
@@ -885,11 +813,4 @@ _MACHINE_TOOLS = {
 
 if __name__ == "__main__":
     db_init()
-    for machine_name, (cell, tools) in _MACHINE_TOOLS.items():
-        register_machine(machine_name, cell, tools)
-    print("All machines registered.")
-
-    from order_receiver import OrderReceiver
-    receiver = OrderReceiver(on_order_received=save_to_db)
-    receiver.start_server()
-    receiver.receive_orders()
+    print("DB initialised and all machines registered.")
