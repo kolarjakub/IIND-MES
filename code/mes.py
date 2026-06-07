@@ -53,7 +53,6 @@ class MES:
         self._dispatched = 0
         self._failed     = 0
         self._day_cycles = 0
-        self._last_tool_times = {}   # machine_index -> [t0,t1,t2], for delta
         threading.Thread(target=self._unload_loop, daemon=True,
                          name="unload-timer").start()
         self._reload_orders_from_db()
@@ -210,6 +209,13 @@ class MES:
             self._pieces_today = 0
         self._snapshot_machine_stats_to_db()
 
+    _MACHINE_NAMES = [
+        'M1a','M1b','M1c',   # C1: indices 0-2
+        'M2a','M2b','M2c',   # C2: indices 3-5
+        'M3a','M3b','M3c',   # C3: indices 6-8
+        'M4a','M4b','M4c',   # C4: indices 9-11
+    ]
+
     def _snapshot_machine_stats_to_db(self):
         """Snapshot PLC machine statistics to DB once per unload cycle."""
         if self._plc is None:
@@ -229,15 +235,8 @@ class MES:
                     occupation_pct  = m["occupation_pct"],
                     tool_changes    = m["tool_changes"],
                     pieces_total    = m["pieces_total"],
+                    piece_type  = m["pieces_by_type"],
                 )
-                # record per-tool time deltas (PLC values are cumulative)
-                from db_handler import record_tool_usage
-                prev = self._last_tool_times.get(i, [0.0, 0.0, 0.0])
-                for j, t in enumerate(m["tool_times"]):
-                    delta = t - prev[j]
-                    if delta > 0:
-                        record_tool_usage(self._MACHINE_NAMES[i], f"T{j+1}", delta, 0)
-                self._last_tool_times[i] = list(m["tool_times"])
         except Exception as _e:
             _log(f"[db] Machine stats snapshot failed: {_e}")
 
@@ -267,32 +266,8 @@ class MES:
         except Exception as exc:
             _log(f"[dispatch] Exception: {exc}")
             return False
-        # Log production start
-        log_ids = []
-        for order in orders:
-            try:
-                from db_handler import log_production_start
-                from opcua_handler import PRODUCT_RECIPES
-                r = PRODUCT_RECIPES.get(order.piece_type.upper(), {})
-                machine = {100:'M1a',200:'M2a',300:'M3a',400:'M4a'}.get(
-                    r.get('cell', 100), 'M1a')
-                log_ids.append(log_production_start(
-                    None, machine, order.piece_type, f"T{r.get('asm_tool',8)}"))
-            except Exception as _e:
-                _log(f"[db] log_production_start failed: {_e}")
-                log_ids.append(None)
-
         _log(f"[dispatch] PLC ack -- {n_slots} slots ({len(orders)} piece(s)) -- polling...")
-        success = self._wait_for_completion(timeout=PRODUCTION_TIMEOUT, max_slots=n_slots + 5)
-
-        try:
-            from db_handler import log_production_end
-            for log_id in log_ids:
-                if log_id:
-                    log_production_end(log_id, success)
-        except Exception as _e:
-            _log(f"[db] log_production_end failed: {_e}")
-        return success
+        return self._wait_for_completion(timeout=PRODUCTION_TIMEOUT, max_slots=n_slots + 5)
 
     def _wait_for_completion(self, timeout: float, max_slots: int = 15) -> bool:
         time.sleep(2.0)
