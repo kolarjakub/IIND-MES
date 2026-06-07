@@ -54,6 +54,7 @@ class MES:
         self._failed     = 0
         self._day_cycles = 0
         self._last_tool_times = {}   # machine_index -> [t0,t1,t2]
+        self._MACHINE_NAMES = ["M1a", "M1b", "M2a", "M2b", "M3a", "M3b", "M4a", "M4b"]
         threading.Thread(target=self._unload_loop, daemon=True,
                          name="unload-timer").start()
         self._reload_orders_from_db()
@@ -73,7 +74,7 @@ class MES:
                         piece_type      = row["type"],
                         quantity        = row["quantity"],
                         quantity_done   = row["quantity_done"],
-                        ddate_days      = row["DDate"],
+                        ddate_days      = row["ddate"],
                         penalty         = row["penalty"],
                         status          = row["status"],
                         started_at      = (
@@ -220,7 +221,7 @@ class MES:
         if self._plc is None:
             return
         try:
-            from db_handler import snapshot_machine_stats
+            from db_handler import snapshot_machine_stats, record_tool_usage, _MACHINE_TOOLS # <-- Přidán import _MACHINE_TOOLS
             machines = self._plc.get_machine_statistics()
             for m in machines:
                 i = m["machine_index"]
@@ -228,20 +229,28 @@ class MES:
                     continue
                 if m["operating_time"] == 0 and m["pieces_total"] == 0:
                     continue
+                
+                machine_name = self._MACHINE_NAMES[i]
+                
                 snapshot_machine_stats(
-                    machine_name    = self._MACHINE_NAMES[i],
+                    machine_name    = machine_name,
                     total_op_time_s = m["operating_time"],
                     occupation_pct  = m["occupation_pct"],
                     tool_changes    = m["tool_changes"],
                     pieces_total    = m["pieces_total"],
                 )
-                from db_handler import record_tool_usage
+                
+                # Získání správných nástrojů pro aktuální stroj (např. ['T8', 'T9', 'T11'])
+                available_tools = _MACHINE_TOOLS[machine_name][1]
+                
                 prev = self._last_tool_times.get(i, [0.0, 0.0, 0.0])
                 for j, t in enumerate(m["tool_times"]):
                     delta = t - prev[j]
                     if delta > 0:
+                        # Zde použijeme skutečný název z pole místo f"T{j+1}"
+                        actual_tool_name = available_tools[j] 
                         record_tool_usage(
-                            self._MACHINE_NAMES[i], f"T{j+1}", delta, 0)
+                            machine_name, actual_tool_name, delta, 0)
                 self._last_tool_times[i] = list(m["tool_times"])
         except Exception as _e:
             _log(f"[db] Machine stats snapshot failed: {_e}")
